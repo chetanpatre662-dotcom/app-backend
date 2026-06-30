@@ -1889,6 +1889,122 @@ function normalize(item) {
 }
 
 /* =========================
+   GPS RELIABILITY ENGINE
+   Single source of truth for GPS freshness.
+   Flutter displays these values — never calculates them.
+========================= */
+const GPS_STATE = {
+  LIVE:     "LIVE",       // 0–25 sec
+  UPDATING: "UPDATING",   // 26–180 sec
+  DELAYED:  "DELAYED",    // 181–300 sec
+  OFFLINE:  "OFFLINE",    // >300 sec
+};
+const GPS_THRESHOLD = {
+  LIVE_MAX:     25,   // seconds
+  UPDATING_MAX: 180,  // seconds
+  DELAYED_MAX:  300,  // seconds
+};
+
+// Track previous state per bus for state-change logging
+const _prevGpsState = {};
+
+/**
+ * Compute GPS reliability metrics for a single bus.
+ * @param {string} provider - "voltysoft" or "sml"
+ * @param {string} busId
+ * @param {string|null} rawGpsTime - raw timestamp from provider
+ * @returns {{ gpsAgeSeconds, gpsState, lastGpsUpdateUtc, lastGpsUpdateIst }}
+ */
+function computeGpsReliability(provider, busId, rawGpsTime) {
+  const serverNow = Date.now();
+
+  // Parse the GPS timestamp
+  let parsedMs = NaN;
+  if (rawGpsTime) {
+    parsedMs = parseVoltyTime(rawGpsTime); // Works for both providers (ISO or IST)
+  }
+
+  // Calculate age
+  let gpsAgeSeconds = -1; // -1 means unknown
+  if (Number.isFinite(parsedMs) && parsedMs > 0) {
+    gpsAgeSeconds = Math.round((serverNow - parsedMs) / 1000);
+    // Guard: negative age means clock skew or future timestamp — treat as unknown
+    if (gpsAgeSeconds < 0) gpsAgeSeconds = -1;
+  }
+
+  // Determine state
+  let gpsState = GPS_STATE.OFFLINE;
+  if (gpsAgeSeconds >= 0) {
+    if (gpsAgeSeconds <= GPS_THRESHOLD.LIVE_MAX) gpsState = GPS_STATE.LIVE;
+    else if (gpsAgeSeconds <= GPS_THRESHOLD.UPDATING_MAX) gpsState = GPS_STATE.UPDATING;
+    else if (gpsAgeSeconds <= GPS_THRESHOLD.DELAYED_MAX) gpsState = GPS_STATE.DELAYED;
+    else gpsState = GPS_STATE.OFFLINE;
+  }
+
+  // State change logging
+  const prev = _prevGpsState[busId];
+  if (prev && prev !== gpsState) {
+    console.log(`[GPS STATE CHANGE] bus=${busId} ${prev} -> ${gpsState} age=${gpsAgeSeconds}s`);
+  }
+  _prevGpsState[busId] = gpsState;
+
+  // Format timestamps
+  let lastGpsUpdateUtc = null;
+  let lastGpsUpdateIst = null;
+  if (Number.isFinite(parsedMs)) {
+    const d = new Date(parsedMs);
+    lastGpsUpdateUtc = d.toISOString();
+    lastGpsUpdateIst = d.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+  }
+
+  // Debug log
+  if (gpsAgeSeconds > GPS_THRESHOLD.LIVE_MAX || gpsAgeSeconds === -1) {
+    console.log(`[GPS] provider=${provider} bus=${busId} gpsAge=${gpsAgeSeconds}s state=${gpsState}`);
+  }
+
+  return { gpsAgeSeconds, gpsState, lastGpsUpdateUtc, lastGpsUpdateIst };
+}
+
+/**
+ * Detect stale GPS packets (same location + same timestamp as previous).
+ * Logs warning when detected.
+ */
+const _lastGpsPacket = {}; // busId → { lat, lng, speed, time }
+function detectStalePacket(provider, busId, lat, lng, speed, rawGpsTime) {
+  const prev = _lastGpsPacket[busId];
+  if (prev) {
+    const sameLocation = prev.lat === lat && prev.lng === lng;
+    const sameSpeed = prev.speed === speed;
+    const sameTimestamp = prev.time === rawGpsTime;
+    if (sameLocation && sameSpeed && sameTimestamp && rawGpsTime) {
+      console.log(`[GPS STALE] provider=${provider} bus=${busId} sameLocation=true sameSpeed=true sameTimestamp=true`);
+    }
+  }
+  _lastGpsPacket[busId] = { lat, lng, speed, time: rawGpsTime };
+}
+
+/**
+ * Safe SML timestamp parser with overflow guard.
+ * SML sends lastOnline as Unix SECONDS. If value > 1e12, it's already ms.
+ */
+function parseSmlTimestamp(lastOnline) {
+  if (!lastOnline) return null;
+  const raw = Number(lastOnline);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    console.log(`[SML TIME ERROR] raw=${lastOnline} parsed=NaN`);
+    return null;
+  }
+  // If > 1e12, it's already milliseconds (not seconds)
+  const ms = raw > 1e12 ? raw : raw * 1000;
+  // Sanity: reject timestamps more than 24 hours in the future
+  if (ms > Date.now() + 86400000) {
+    console.log(`[SML TIME ERROR] raw=${lastOnline} parsed=${new Date(ms).toISOString()} (future — rejected)`);
+    return null;
+  }
+  return new Date(ms).toISOString();
+}
+
+/* =========================
    PUSH NOTIFICATION
 ========================= */
 async function sendPush(topic, title, body) {
@@ -1970,6 +2086,11 @@ async function formatBuses(data) {
       lastBusLocationTime[d.imei] = now;
       logBusUpdate(busId, item.time || null);
 
+      // ── GPS Reliability Engine ──
+      const rawGpsTime = item.time || null;
+      detectStalePacket("voltysoft", busId, d.lat, d.lng, d.speed, rawGpsTime);
+      const gpsReliability = computeGpsReliability("voltysoft", busId, rawGpsTime);
+
       return {
         busId,
         driver: driverMap[busId] || "N/A",
@@ -2003,14 +2124,20 @@ async function formatBuses(data) {
           lat: d.lat,
           lng: d.lng,
           speed: Number(d.speed || 0),
-          lastUpdate: null,
+          lastUpdate: rawGpsTime,
         }),
 
         tripActive: d.speed > 10,
 
-        gpsTime: item.time || null,
-        lastUpdate: item.time || null,
+        gpsTime: rawGpsTime,
+        lastUpdate: rawGpsTime,
         timestamp: Date.now(),
+
+        // ── GPS Reliability fields (new) ──
+        gpsAgeSeconds: gpsReliability.gpsAgeSeconds,
+        gpsState: gpsReliability.gpsState,
+        lastGpsUpdateUtc: gpsReliability.lastGpsUpdateUtc,
+        lastGpsUpdateIst: gpsReliability.lastGpsUpdateIst,
       };
     })
   );
@@ -2109,30 +2236,13 @@ async function formatSMLBuses(data) {
         : null;
  lastBusLocationTime[imei] = now;
 
-        // ── TEMPORARY DEBUG — remove after capturing values ──────────────
-        // console.log('RAW SML TIME', {
-        //   chassis:    item.chassisNumber,
-        //   lastOnline: item.lastOnline,
-        //   type:       typeof item.lastOnline,
-        // });
-        // ─────────────────────────────────────────────────────────────────
-
-        const gpsTime =
-  item.lastOnline
-    ? new Date(Number(item.lastOnline) * 1000).toISOString()
-    : null;
-
-        // ── TEMPORARY DEBUG — remove after capturing values ──────────────
-        // console.log('PARSED SML TIME', {
-        //   chassis:  item.chassisNumber,
-        //   gpsTime,
-        //   now:      new Date().toISOString(),
-        // });
-        // ─────────────────────────────────────────────────────────────────
+        const gpsTime = parseSmlTimestamp(item.lastOnline);
 
 logBusUpdate(busId, gpsTime);
 
-     
+      // ── GPS Reliability Engine ──
+      detectStalePacket("sml", busId, Number(item.latitude), Number(item.longitude), Number(item.speed || 0), gpsTime);
+      const gpsReliability = computeGpsReliability("sml", busId, gpsTime);
 
       return {
         busId,
@@ -2171,16 +2281,19 @@ logBusUpdate(busId, gpsTime);
           lat: Number(item.latitude),
           lng: Number(item.longitude),
           speed: Number(item.speed || 0),
-          lastUpdate: null,
+          lastUpdate: gpsTime,
         }),
 
         tripActive: Number(item.speed) > 5,
 
-        lastUpdate: item.lastOnline
-          ? new Date(Number(item.lastOnline) * 1000).toISOString()
-          : null,
-
+        lastUpdate: gpsTime,
         timestamp: Date.now(),
+
+        // ── GPS Reliability fields (new) ──
+        gpsAgeSeconds: gpsReliability.gpsAgeSeconds,
+        gpsState: gpsReliability.gpsState,
+        lastGpsUpdateUtc: gpsReliability.lastGpsUpdateUtc,
+        lastGpsUpdateIst: gpsReliability.lastGpsUpdateIst,
       };
     })
   );
