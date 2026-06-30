@@ -29,13 +29,14 @@ async function findClosedTicketByUser(userId) {
 }
 
 async function createTicket(data) {
-  // Generate ticket number
+  // Generate ticket number atomically using a transaction to prevent duplicates
   const counterRef = db().collection(COLLECTIONS.COUNTER).doc("ticketCounter");
-  const counterDoc = await counterRef.get();
-  let nextNum = 1;
-  if (counterDoc.exists) nextNum = (counterDoc.data().count || 0) + 1;
-  await counterRef.set({ count: nextNum }, { merge: true });
-  const ticketNumber = `TKT-${String(nextNum).padStart(5, "0")}`;
+  const ticketNumber = await db().runTransaction(async (txn) => {
+    const counterDoc = await txn.get(counterRef);
+    const nextNum = (counterDoc.exists ? (counterDoc.data().count || 0) : 0) + 1;
+    txn.set(counterRef, { count: nextNum }, { merge: true });
+    return `TKT-${String(nextNum).padStart(5, "0")}`;
+  });
 
   const ref = await tickets().add({
     ticketNumber, ...data,

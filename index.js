@@ -4246,13 +4246,14 @@ app.post("/api/tickets", ticketLimiter, authenticateFirebaseUser, async (req, re
         await ticketRef.update({ status: "open" });
         console.log("[TICKET] Reopened:", ticketNumber);
       } else {
-        // Create brand new ticket
+        // Create brand new ticket (atomic counter via transaction)
         const counterRef = admin.firestore().collection("system").doc("ticketCounter");
-        const counterDoc = await counterRef.get();
-        let nextNum = 1;
-        if (counterDoc.exists) nextNum = (counterDoc.data().count || 0) + 1;
-        await counterRef.set({ count: nextNum }, { merge: true });
-        ticketNumber = `TKT-${String(nextNum).padStart(5, "0")}`;
+        ticketNumber = await admin.firestore().runTransaction(async (txn) => {
+          const counterDoc = await txn.get(counterRef);
+          const nextNum = (counterDoc.exists ? (counterDoc.data().count || 0) : 0) + 1;
+          txn.set(counterRef, { count: nextNum }, { merge: true });
+          return `TKT-${String(nextNum).padStart(5, "0")}`;
+        });
 
         const newRef = await admin.firestore().collection("support_tickets").add({
           ticketNumber,
@@ -4349,11 +4350,16 @@ app.get("/api/tickets/user/:userId", authenticateFirebaseUser, async (req, res) 
 app.get("/api/tickets/:ticketId/messages", authenticateAny, async (req, res) => {
   try {
     const { ticketId } = req.params;
-    // Ownership check (skip for admins)
+    const ticketDoc = await admin.firestore().collection("support_tickets").doc(ticketId).get();
+    if (!ticketDoc.exists) return res.status(404).json({ success: false, error: "Ticket not found" });
+    const ticketData = ticketDoc.data();
+    // Ownership check for users
     if (!req.isAdmin) {
-      const ticketDoc = await admin.firestore().collection("support_tickets").doc(ticketId).get();
-      if (!ticketDoc.exists) return res.status(404).json({ success: false, error: "Ticket not found" });
-      if (ticketDoc.data().userId !== req.firebaseUid) return res.status(403).json({ success: false, error: "Access denied" });
+      if (ticketData.userId !== req.firebaseUid) return res.status(403).json({ success: false, error: "Access denied" });
+    } else {
+      // Institution isolation for admins
+      const inst = resolveInstitutionFilter(req);
+      if (inst && ticketData.institution !== inst) return res.status(403).json({ success: false, error: "Access denied — wrong institution" });
     }
     // Query without orderBy to avoid composite index requirement
     const snap = await admin.firestore().collection("ticket_messages")
@@ -4390,6 +4396,13 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
     // Ownership check: non-admin users can only message their own tickets
     if (!req.isAdmin && ticketData.userId !== req.firebaseUid) {
       return res.status(403).json({ success: false, error: "Access denied" });
+    }
+    // Institution isolation for admins
+    if (req.isAdmin) {
+      const inst = resolveInstitutionFilter(req);
+      if (inst && ticketData.institution !== inst) {
+        return res.status(403).json({ success: false, error: "Access denied — wrong institution" });
+      }
     }
 
     if (ticketData.status === "closed") return res.status(400).json({ success: false, error: "Ticket is closed" });
@@ -4475,10 +4488,24 @@ app.patch("/admin/tickets/:ticketId/status", adminAuth, async (req, res) => {
     if (!["open", "pending", "resolved", "closed"].includes(status)) {
       return res.status(400).json({ success: false, error: "Invalid status" });
     }
+    // Institution isolation: admin can only modify tickets of their institution
+    const ticketDoc = await admin.firestore().collection("support_tickets").doc(ticketId).get();
+    if (!ticketDoc.exists) return res.status(404).json({ success: false, error: "Ticket not found" });
+    const inst = resolveInstitutionFilter(req);
+    if (inst && ticketDoc.data().institution !== inst) {
+      return res.status(403).json({ success: false, error: "Access denied — wrong institution" });
+    }
     await admin.firestore().collection("support_tickets").doc(ticketId).update({
       status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+
+    // Broadcast status change via WebSocket to all connected clients
+    try {
+      const wsPayload = JSON.stringify({ type: "ticket:status", ticketId, status });
+      wss.clients.forEach((c) => { if (c.readyState === 1) try { c.send(wsPayload); } catch (_) {} });
+    } catch (_) {}
+
     return res.json({ success: true });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
@@ -4489,6 +4516,13 @@ app.patch("/admin/tickets/:ticketId/status", adminAuth, async (req, res) => {
 app.post("/admin/tickets/:ticketId/read", adminAuth, async (req, res) => {
   try {
     const { ticketId } = req.params;
+    // Institution isolation: admin can only access tickets of their institution
+    const ticketDoc = await admin.firestore().collection("support_tickets").doc(ticketId).get();
+    if (!ticketDoc.exists) return res.status(404).json({ success: false, error: "Ticket not found" });
+    const inst = resolveInstitutionFilter(req);
+    if (inst && ticketDoc.data().institution !== inst) {
+      return res.status(403).json({ success: false, error: "Access denied — wrong institution" });
+    }
     // Mark all unread user messages as read
     const snap = await admin.firestore().collection("ticket_messages")
       .where("ticketId", "==", ticketId)
@@ -4510,10 +4544,13 @@ app.post("/admin/tickets/:ticketId/read", adminAuth, async (req, res) => {
 app.get("/admin/tickets/user-history/:userId", adminAuth, async (req, res) => {
   try {
     const { userId } = req.params;
+    const inst = resolveInstitutionFilter(req);
     const snap = await admin.firestore().collection("support_tickets")
       .where("userId", "==", userId)
       .get();
+    // Filter by institution in memory (userId query already narrows result set)
     const tickets = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .filter(t => !inst || t.institution === inst)
       .sort((a, b) => {
         const ta = a.createdAt?._seconds || a.createdAt?.seconds || 0;
         const tb = b.createdAt?._seconds || b.createdAt?.seconds || 0;
@@ -4617,15 +4654,23 @@ app.post("/admin/bulk-ticket-status", adminAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: "Invalid status" });
     }
 
+    const inst = resolveInstitutionFilter(req);
     const batch = admin.firestore().batch();
+    let updated = 0;
     for (const id of ticketIds.slice(0, 50)) { // Max 50 per batch
       const ref = admin.firestore().collection("support_tickets").doc(id);
+      // Institution isolation: verify each ticket belongs to this admin's institution
+      if (inst) {
+        const doc = await ref.get();
+        if (!doc.exists || doc.data().institution !== inst) continue; // skip foreign tickets
+      }
       batch.update(ref, { status, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+      updated++;
     }
     await batch.commit();
 
-    await logAuditEvent("bulk_ticket_status", req.adminRole, req.adminInstitution, { ticketIds, status });
-    return res.json({ success: true, updated: Math.min(ticketIds.length, 50) });
+    await logAuditEvent("bulk_ticket_status", req.adminRole, req.adminInstitution, { ticketIds, status, updated });
+    return res.json({ success: true, updated });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
   }

@@ -181,11 +181,12 @@ async function handleTicketEvent(ws, parsed, wss) {
 }
 
 // ── Attach to existing wss instance ──────────────────────────────────────────
+let _attached = false;
 function attachToWss(wss) {
-  // Monkey-patch the existing connection handler to also handle ticket events
-  const originalEmit = wss._events.connection;
+  if (_attached) return; // Prevent double-attach
+  _attached = true;
 
-  wss.on("connection", (ws, req) => {
+  wss.on("connection", (ws) => {
     // Add ticket cleanup on close
     ws.on("close", () => cleanupClient(ws));
 
@@ -194,15 +195,16 @@ function attachToWss(wss) {
       try {
         const parsed = JSON.parse(raw);
         if (parsed.type && parsed.type.startsWith("ticket:")) {
-          handleTicketEvent(ws, parsed, wss);
-          return; // Don't let other handlers process ticket events
+          handleTicketEvent(ws, parsed, wss).catch(e => {
+            console.log("[TICKET WS] Unhandled event error:", e.message);
+          });
         }
       } catch (_) {}
-      // Non-ticket messages fall through to existing handler
+      // Non-ticket messages fall through to other handlers naturally
     });
   });
 
-  console.log("🎫 Ticket WebSocket handler attached to existing wss");
+  console.log("[TICKET WS] Handler attached to wss");
 }
 
 module.exports = { attachToWss, broadcastToRoom, broadcastGlobal, cleanupClient };
