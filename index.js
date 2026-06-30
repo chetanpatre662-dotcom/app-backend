@@ -4324,8 +4324,26 @@ app.post("/api/tickets", ticketLimiter, authenticateFirebaseUser, async (req, re
 app.get("/api/tickets/user/:userId", authenticateFirebaseUser, async (req, res) => {
   try {
     const { userId } = req.params;
-    // Ownership check: user can only access their own tickets
-    if (req.firebaseUid !== userId) {
+    // Ownership check: userId param is Firestore doc ID, req.firebaseUid is Firebase Auth UID
+    let isOwner = req.firebaseUid === userId;
+    if (!isOwner) {
+      // Check all user collections — the document at userId should have uid matching req.firebaseUid
+      const cols = ["students", "parents", "faculty"];
+      for (const col of cols) {
+        const userDoc = await admin.firestore().collection(col).doc(userId).get();
+        if (userDoc.exists) {
+          const storedUid = userDoc.data().uid;
+          if (storedUid === req.firebaseUid) { isOwner = true; break; }
+          if (!storedUid) {
+            // Legacy doc without uid field — reverse lookup
+            const uidSnap = await admin.firestore().collection(col)
+              .where("uid", "==", req.firebaseUid).limit(1).get();
+            if (!uidSnap.empty && uidSnap.docs[0].id === userId) { isOwner = true; break; }
+          }
+        }
+      }
+    }
+    if (!isOwner) {
       return res.status(403).json({ success: false, error: "Access denied" });
     }
     // Query without orderBy to avoid composite index requirement
@@ -4355,7 +4373,34 @@ app.get("/api/tickets/:ticketId/messages", authenticateAny, async (req, res) => 
     const ticketData = ticketDoc.data();
     // Ownership check for users
     if (!req.isAdmin) {
-      if (ticketData.userId !== req.firebaseUid) return res.status(403).json({ success: false, error: "Access denied" });
+      // ticketData.userId is the Firestore document ID (e.g. "student-001");
+      // req.firebaseUid is the Firebase Auth UID (e.g. "xY7kP...").
+      // They differ because the app uses sequential IDs for documents.
+      // Strategy: check if the user document at that ID has a matching uid field,
+      // OR query by uid to find the user's document ID.
+      let isOwner = ticketData.userId === req.firebaseUid;
+      if (!isOwner) {
+        const role = ticketData.role || "student";
+        const cols = { student: "students", parent: "parents", faculty: "faculty" };
+        const col = cols[role] || "students";
+        // Primary: look up user doc by ID, check uid field
+        const userDoc = await admin.firestore().collection(col).doc(ticketData.userId).get();
+        if (userDoc.exists) {
+          const storedUid = userDoc.data().uid;
+          if (storedUid === req.firebaseUid) {
+            isOwner = true;
+          } else if (!storedUid) {
+            // Document exists but uid field is missing (legacy registration).
+            // Reverse lookup: find user by Firebase UID in same collection.
+            const uidSnap = await admin.firestore().collection(col)
+              .where("uid", "==", req.firebaseUid).limit(1).get();
+            if (!uidSnap.empty && uidSnap.docs[0].id === ticketData.userId) {
+              isOwner = true;
+            }
+          }
+        }
+      }
+      if (!isOwner) return res.status(403).json({ success: false, error: "Access denied" });
     } else {
       // Institution isolation for admins
       const inst = resolveInstitutionFilter(req);
@@ -4397,8 +4442,27 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
     const ticketData = ticketDoc.data();
 
     // Ownership check: non-admin users can only message their own tickets
-    if (!req.isAdmin && ticketData.userId !== req.firebaseUid) {
-      return res.status(403).json({ success: false, error: "Access denied" });
+    if (!req.isAdmin) {
+      let isOwner = ticketData.userId === req.firebaseUid;
+      if (!isOwner) {
+        const role = ticketData.role || "student";
+        const cols = { student: "students", parent: "parents", faculty: "faculty" };
+        const col = cols[role] || "students";
+        const userDoc = await admin.firestore().collection(col).doc(ticketData.userId).get();
+        if (userDoc.exists) {
+          const storedUid = userDoc.data().uid;
+          if (storedUid === req.firebaseUid) {
+            isOwner = true;
+          } else if (!storedUid) {
+            const uidSnap = await admin.firestore().collection(col)
+              .where("uid", "==", req.firebaseUid).limit(1).get();
+            if (!uidSnap.empty && uidSnap.docs[0].id === ticketData.userId) {
+              isOwner = true;
+            }
+          }
+        }
+      }
+      if (!isOwner) return res.status(403).json({ success: false, error: "Access denied" });
     }
     // Institution isolation for admins
     if (req.isAdmin) {
