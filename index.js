@@ -4381,14 +4381,17 @@ app.get("/api/tickets/:ticketId/messages", authenticateAny, async (req, res) => 
 
 // POST /api/tickets/:ticketId/messages — Send a message (user or admin)
 app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, async (req, res) => {
+  const _t0 = Date.now();
   try {
     const { ticketId } = req.params;
     const { senderId, senderType, senderName, message } = req.body;
     if (!message || typeof message !== "string" || !message.trim()) return res.status(400).json({ success: false, error: "message required" });
     if (message.length > 2000) return res.status(400).json({ success: false, error: "message too long (max 2000)" });
 
+    const _t1 = Date.now();
     const ticketRef = admin.firestore().collection("support_tickets").doc(ticketId);
     const ticketDoc = await ticketRef.get();
+    const _t2 = Date.now();
     if (!ticketDoc.exists) return res.status(404).json({ success: false, error: "Ticket not found" });
 
     const ticketData = ticketDoc.data();
@@ -4407,31 +4410,34 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
 
     if (ticketData.status === "closed") return res.status(400).json({ success: false, error: "Ticket is closed" });
 
-    // Add message
+    // Add message + update ticket metadata in parallel (independent operations)
     const cleanMsg = sanitize(message);
-    const msgRef = await admin.firestore().collection("ticket_messages").add({
-      ticketId,
-      senderType: senderType || "user",
-      senderId: senderId || "",
-      senderName: sanitize(senderName || ""),
-      message: cleanMsg,
-      isRead: false,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // Update ticket metadata
     const isAdmin = senderType === "admin";
-    await ticketRef.update({
-      lastMessage: cleanMsg,
-      lastMessageBy: senderType || "user",
-      lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      messageCount: admin.firestore.FieldValue.increment(1),
-      ...(isAdmin ? { unreadUser: admin.firestore.FieldValue.increment(1), unreadAdmin: 0, status: "pending" } :
-                    { unreadAdmin: admin.firestore.FieldValue.increment(1), unreadUser: 0 }),
-    });
+    const _t3 = Date.now();
+    const [msgRef] = await Promise.all([
+      admin.firestore().collection("ticket_messages").add({
+        ticketId,
+        senderType: senderType || "user",
+        senderId: senderId || "",
+        senderName: sanitize(senderName || ""),
+        message: cleanMsg,
+        isRead: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }),
+      ticketRef.update({
+        lastMessage: cleanMsg,
+        lastMessageBy: senderType || "user",
+        lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        messageCount: admin.firestore.FieldValue.increment(1),
+        ...(isAdmin ? { unreadUser: admin.firestore.FieldValue.increment(1), unreadAdmin: 0, status: "pending" } :
+                      { unreadAdmin: admin.firestore.FieldValue.increment(1), unreadUser: 0 }),
+      }),
+    ]);
+    const _t4 = Date.now();
 
     // ── Broadcast ticket update via WebSocket for instant delivery ──
+    const _t5 = Date.now();
     try {
       const wsPayload = JSON.stringify({
         type: "ticket_message",
@@ -4445,18 +4451,22 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
         }
       });
     } catch (_) {}
+    const _t6 = Date.now();
 
-    // ── Create notification for the recipient ──
+    // ── Create notification for the recipient (fire-and-forget — don't block response) ──
     if (isAdmin) {
-      // Admin replied → notify the student
-      await createUserNotification(ticketData.userId, "ticket_reply",
+      createUserNotification(ticketData.userId, "ticket_reply",
         "Admin replied to your ticket",
         message.trim().substring(0, 100),
         { ticketId, ticketNumber: ticketData.ticketNumber || "" });
     }
 
+    const _t7 = Date.now();
+    console.log(`[TICKET PERF] ticketRef.get: ${_t2-_t1}ms | write(add+update): ${_t4-_t3}ms | broadcast: ${_t6-_t5}ms | total: ${_t7-_t0}ms | ticketId: ${ticketId}`);
+
     return res.json({ success: true, messageId: msgRef.id });
   } catch (e) {
+    console.log(`[TICKET PERF] ERROR after ${Date.now()-_t0}ms:`, e.message);
     return res.status(500).json({ success: false, error: e.message });
   }
 });
