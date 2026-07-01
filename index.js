@@ -1925,7 +1925,16 @@ function _formatIst(parsedMs) {
   // Round to second (avoid cache bloat from ms differences)
   const key = Math.floor(parsedMs / 1000);
   if (_istFormatCache[key]) return _istFormatCache[key];
-  const result = new Date(parsedMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+  const result = new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(new Date(parsedMs)) + " IST";
   // Evict cache if too large (simple LRU-free eviction)
   if (_istCacheSize >= _IST_CACHE_MAX) {
     const keys = Object.keys(_istFormatCache);
@@ -1975,20 +1984,17 @@ function computeGpsReliability(provider, busId, parsedMs, serverNow) {
     _prevGpsState[busId] = gpsState;
   }
 
-  // Format timestamps — only when NOT live (live buses don't need IST display)
+  // Format timestamps — always provide IST for display
   let lastGpsUpdateUtc = null;
   let lastGpsUpdateIst = null;
   if (Number.isFinite(parsedMs)) {
     lastGpsUpdateUtc = new Date(parsedMs).toISOString();
-    // Only compute expensive IST format when state is not LIVE
-    if (gpsState !== GPS_STATE.LIVE) {
-      lastGpsUpdateIst = _formatIst(parsedMs);
-    }
+    lastGpsUpdateIst = _formatIst(parsedMs);
   }
 
   // Debug log — only for non-LIVE states (reduces log volume for healthy buses)
   if (gpsState !== GPS_STATE.LIVE) {
-    console.log(`[GPS] provider=${provider} bus=${busId} gpsAge=${gpsAgeSeconds}s state=${gpsState}`);
+    console.log(`[GPS] provider=${provider} bus=${busId} gpsAge=${gpsAgeSeconds}s state=${gpsState} gpsTimeUtc=${lastGpsUpdateUtc} gpsTimeIst=${lastGpsUpdateIst} serverUtc=${new Date(serverNow).toISOString()} serverIst=${_formatIst(serverNow)}`);
   }
 
   return { gpsAgeSeconds, gpsState, lastGpsUpdateUtc, lastGpsUpdateIst };
