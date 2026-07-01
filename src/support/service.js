@@ -77,6 +77,25 @@ async function adminReply(ticketId, senderId, senderName, message) {
     status: TICKET_STATUS.PENDING,
   });
 
+  // ── FCM push notification for ticket reply (fire-and-forget) ────────────
+  try {
+    const admin = require("firebase-admin");
+    const role = ticket.role || "student";
+    const cols = { student: "students", parent: "parents", faculty: "faculty" };
+    const col = cols[role] || "students";
+    const userDoc = await admin.firestore().collection(col).doc(ticket.userId).get();
+    if (userDoc.exists) {
+      const fcmToken = userDoc.data().fcmToken;
+      if (fcmToken && fcmToken.length > 10) {
+        await admin.messaging().send({
+          token: fcmToken,
+          notification: { title: "Support Reply", body: message.trim().substring(0, 100) },
+          data: { type: "ticket_reply", ticketId, ticketNumber: ticket.ticketNumber || "" },
+        });
+      }
+    }
+  } catch (_) { /* Non-fatal */ }
+
   return { messageId: msg.id, userId: ticket.userId, ticketNumber: ticket.ticketNumber };
 }
 

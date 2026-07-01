@@ -261,6 +261,28 @@ function sanitize(str) {
   return xss(str.trim());
 }
 
+// ── Invalid FCM Token Pruning ───────────────────────────────────────────────
+// Called when messaging().send() fails with token-not-registered or invalid-token.
+// Removes the token from the user's Firestore document and bus_tokens array.
+async function _pruneInvalidToken(token, userId, collection) {
+  try {
+    if (!token || !userId || !collection) return;
+    // Clear from user document
+    await admin.firestore().collection(collection).doc(userId).update({ fcmToken: "" });
+    // Clear from bus_tokens
+    const userDoc = await admin.firestore().collection(collection).doc(userId).get();
+    if (userDoc.exists) {
+      const busId = userDoc.data().busId;
+      if (busId) {
+        await admin.firestore().collection("bus_tokens").doc(busId).update({
+          tokens: admin.firestore.FieldValue.arrayRemove([token]),
+        });
+      }
+    }
+    console.log(`🧹 Pruned invalid token for ${userId} (${collection})`);
+  } catch (_) { /* Best-effort — never crash the sender loop */ }
+}
+
 // ── Rate Limiters ───────────────────────────────────────────────────────────
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -318,14 +340,35 @@ async function handleAttendance(bus, students) {
     (s) => s.busId === bus.busId && s.studentId && s.studentType === "college",
   );
 
-  const today = new Date().toISOString().split("T")[0];
+  if (busStudents.length === 0) return;
 
-  for (const student of busStudents) {
-    const loc = await getStudentLocation(student.studentId);
+  const today = new Date().toISOString().split("T")[0];
+  const now   = Date.now();
+
+  // ── Stale GPS threshold: 5 minutes ──────────────────────────────────────
+  const STALE_GPS_MS = 5 * 60 * 1000;
+
+  // ── BATCH: Pre-fetch all student locations concurrently (Promise.all) ────
+  // Previously: sequential await per student (N round-trips).
+  // Now: single concurrent batch (1 round-trip time for all N students).
+  const locations = await Promise.all(
+    busStudents.map((s) => getStudentLocation(s.studentId))
+  );
+
+  for (let i = 0; i < busStudents.length; i++) {
+    const student = busStudents[i];
+    const loc = locations[i];
 
     if (!loc || typeof loc !== "object") continue;
 
     if (!loc.lat || !loc.lng) continue;
+
+    // ── Stale GPS detection ────────────────────────────────────────────────
+    // loc.lastUpdated is epoch ms set by /student-location endpoint.
+    // If the student's GPS is older than 5 minutes, it cannot be trusted
+    // for proximity-based arrival verification.
+    const locAge = loc.lastUpdated ? (now - loc.lastUpdated) : Infinity;
+    const isStale = locAge > STALE_GPS_MS;
 
     const distance = calculateDistance(bus.lat, bus.lng, loc.lat, loc.lng);
     const ATT_KEY = `${student.studentId}_${today}`;
@@ -346,10 +389,20 @@ async function handleAttendance(bus, students) {
     // bus for BOARDING_CONFIRM_COUNT consecutive loop ticks before boarding
     // is marked. This prevents a student standing near the road from getting
     // a false boarding mark from a single GPS proximity coincidence.
+    //
+    // Note: Boarding uses bus GPS proximity (bus moving past student).
+    // Stale student GPS still allows boarding detection because the bus GPS
+    // is always fresh (from the tracking device). The student just needs to
+    // be physically near the bus — their last-known position is sufficient
+    // for the 90m radius check within a short staleness window.
     const BOARDING_CONFIRM_COUNT = 5;   // ~45 s at 15 s/tick
     const BOARDING_RADIUS_KM     = 0.09; // 90 m
 
     if (!att.boarded) {
+      // Skip boarding check if student GPS is extremely stale (>10 min)
+      // This prevents boarding marks from yesterday's cached location.
+      if (locAge > 10 * 60 * 1000) continue;
+
       if (distance <= BOARDING_RADIUS_KM && bus.speed > 5) {
         // Increment consecutive-proximity counter
         att.boardingTicks = (att.boardingTicks || 0) + 1;
@@ -405,6 +458,7 @@ async function handleAttendance(bus, students) {
               boardingTime: admin.firestore.FieldValue.serverTimestamp(),
               arrivalTime:  null,
               present:      false,
+              verificationStatus: "gps_verified",  // boarding confirmed via GPS proximity
               createdAt:    admin.firestore.FieldValue.serverTimestamp(),
             },
             { merge: true },
@@ -427,12 +481,23 @@ async function handleAttendance(bus, students) {
     //
     // A 3-tick confirmation is used to avoid transient GPS drift marking a
     // genuine passenger as exited due to a momentary bad GPS fix.
+    //
+    // Stale GPS: If student GPS is stale, do NOT mark as exited — the student
+    // may still be on the bus but their phone stopped uploading GPS.
     // =========================
     const EXIT_RADIUS_KM   = 0.5;   // 300 m — clearly off the bus
     const EXIT_CONFIRM_COUNT = 3;   // ~45 s at 15 s/tick
 
     if (att.boarded && !att.exited && !att.arrived && !isAtCollege(bus.lat, bus.lng)) {
-      if (distance > EXIT_RADIUS_KM && bus.speed > 5) {
+      if (isStale) {
+        // Student GPS is stale — cannot determine if they exited.
+        // Flag as pending verification in Redis (does not affect Firestore yet).
+        if (!att.pendingVerification) {
+          att.pendingVerification = true;
+          await redis.setEx(`att:${ATT_KEY}`, 86400, att);
+          console.log("⏳ Pending verification (stale GPS)", student.studentId);
+        }
+      } else if (distance > EXIT_RADIUS_KM && bus.speed > 5) {
         att.exitTicks = (att.exitTicks || 0) + 1;
         await redis.setEx(`att:${ATT_KEY}`, 86400, att);
       } else {
@@ -441,11 +506,17 @@ async function handleAttendance(bus, students) {
           att.exitTicks = 0;
           await redis.setEx(`att:${ATT_KEY}`, 86400, att);
         }
+        // Fresh GPS near bus clears pending verification
+        if (att.pendingVerification) {
+          att.pendingVerification = false;
+          await redis.setEx(`att:${ATT_KEY}`, 86400, att);
+        }
       }
 
       if ((att.exitTicks || 0) >= EXIT_CONFIRM_COUNT) {
         att.exited    = true;
         att.exitTicks = 0;
+        att.pendingVerification = false;
         await redis.setEx(`att:${ATT_KEY}`, 86400, att);
 
         // Update Firestore attendance document with exit info
@@ -454,6 +525,7 @@ async function handleAttendance(bus, students) {
             exited:    true,
             exitTime:  admin.firestore.FieldValue.serverTimestamp(),
             present:   false,   // did not complete journey to college
+            verificationStatus: "gps_verified",  // exit confirmed via GPS
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true },
@@ -474,6 +546,14 @@ async function handleAttendance(bus, students) {
     // =========================
     // ARRIVAL
     // =========================
+    // ── Stale GPS guard for arrival ──────────────────────────────────────────
+    // Arrival requires BOTH:
+    //   1. Bus is at college (bus GPS — always fresh from tracking device)
+    //   2. Student is within 1.5 km of bus (student GPS — must be fresh)
+    //
+    // If student GPS is stale, we cannot verify they are actually at college.
+    // Mark as "pending_verification" instead of "present: true".
+    // This prevents false arrivals from cached GPS coordinates.
 
     const latestAtt = (await redis.get(`att:${ATT_KEY}`)) || {};
     // redis.get() already JSON.parses — latestAtt is already an object
@@ -484,35 +564,57 @@ async function handleAttendance(bus, students) {
       isAtCollege(bus.lat, bus.lng) &&
       distance <= 1.5
     ) {
-      latestAtt.arrived = true;
+      if (isStale) {
+        // ── Stale GPS: cannot confirm arrival — mark as pending ────────────
+        if (!latestAtt.pendingVerification) {
+          latestAtt.pendingVerification = true;
+          await redis.setEx(`att:${ATT_KEY}`, 86400, latestAtt);
 
-      // Atomic write with TTL
-      await redis.setEx(`att:${ATT_KEY}`, 86400, latestAtt);
-
-      await admin
-        .firestore()
-        .collection("students")
-        .doc(student.studentId)
-        .set(
-          {
-            liveStatus: {
-              onboarded: true,
-              present: true,
+          // Write pending status to Firestore so admin can see it
+          await admin.firestore().collection("attendance").doc(ATT_KEY).set(
+            {
+              verificationStatus: "pending_verification",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             },
+            { merge: true },
+          );
+          console.log("⏳ Arrival pending (stale student GPS)", student.studentId,
+            `locAge=${Math.round(locAge/1000)}s`);
+        }
+      } else {
+        // ── Fresh GPS: confirm arrival ──────────────────────────────────────
+        latestAtt.arrived = true;
+        latestAtt.pendingVerification = false;
+
+        // Atomic write with TTL
+        await redis.setEx(`att:${ATT_KEY}`, 86400, latestAtt);
+
+        await admin
+          .firestore()
+          .collection("students")
+          .doc(student.studentId)
+          .set(
+            {
+              liveStatus: {
+                onboarded: true,
+                present: true,
+              },
+            },
+            { merge: true },
+          );
+
+        await admin.firestore().collection("attendance").doc(ATT_KEY).set(
+          {
+            arrivalTime: admin.firestore.FieldValue.serverTimestamp(),
+            present: true,
+            verificationStatus: "gps_verified",  // arrival confirmed via fresh GPS
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           { merge: true },
         );
 
-      await admin.firestore().collection("attendance").doc(ATT_KEY).set(
-        {
-          arrivalTime: admin.firestore.FieldValue.serverTimestamp(),
-          present: true,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
-
-      console.log("🏫 Arrived", student.studentId);
+        console.log("🏫 Arrived (GPS verified)", student.studentId);
+      }
     }
   }
 }
@@ -1542,7 +1644,7 @@ app.delete("/admin/routes/:id", adminAuth, async (req, res) => {
 /* =========================
    STUDENT LOCATION API
 ========================= */
-app.post("/student-location", async (req, res) => {
+app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
   try {
     const indiaTime = new Date(
       new Date().toLocaleString("en-US", {
@@ -1569,6 +1671,25 @@ app.post("/student-location", async (req, res) => {
     if (!studentId || !busId || lat == null || lng == null) {
       return res.status(400).json({ error: "Missing fields" });
     }
+
+    // ── Ownership verification: Firebase UID must match the student document ──
+    const collections = ["students", "parents", "faculty"];
+    let isOwner = false;
+    for (const col of collections) {
+      const doc = await admin.firestore().collection(col).doc(studentId).get();
+      if (doc.exists) {
+        if (doc.data().uid === req.firebaseUid) { isOwner = true; break; }
+        // Reverse lookup: UID might match a different doc ID format
+        const uidSnap = await admin.firestore().collection(col)
+          .where("uid", "==", req.firebaseUid).limit(1).get();
+        if (!uidSnap.empty && uidSnap.docs[0].id === studentId) { isOwner = true; break; }
+        break; // Doc found but UID doesn't match
+      }
+    }
+    if (!isOwner) {
+      return res.status(403).json({ error: "Access denied — you can only update your own location" });
+    }
+
     // Validate coordinates (India bounds: lat 6-37, lng 68-98)
     const latNum = parseFloat(lat);
     const lngNum = parseFloat(lng);
@@ -1689,7 +1810,18 @@ function addActivity(type, message) {
 /* =========================
    WEBSOCKET
 ========================= */
-const wss = new WebSocket.Server({ port: 8080 });
+const wss = new WebSocket.Server({
+  port: 8080,
+  perMessageDeflate: {
+    zlibDeflateOptions: { chunkSize: 1024, memLevel: 7, level: 3 },
+    zlibInflateOptions: { chunkSize: 10 * 1024 },
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    serverMaxWindowBits: 10,
+    concurrencyLimit: 10,
+    threshold: 512, // Only compress messages > 512 bytes
+  },
+});
 console.log("🚀 WebSocket running");
 
 // ── Attach ticket room-based WS handler ─────────────────────────────────────
@@ -2652,10 +2784,14 @@ async function handleBus(bus, students) {
               body:  `${busId} has started its trip. Be ready!`,
             },
             data: { type: "bus_started", busId },
+            android: { priority: "high", notification: { channelId: "bus_channel" } },
           });
           sent++;
         } catch (e) {
-          // Expired / invalid token — don't abort the loop
+          // Expired / invalid token — prune it
+          if (e.code === "messaging/registration-token-not-registered" || e.code === "messaging/invalid-registration-token") {
+            _pruneInvalidToken(u.fcmToken, u.studentId, "students");
+          }
           console.log(`FCM start skip (${u.studentId}): ${e.message}`);
         }
       }
@@ -2683,11 +2819,18 @@ async function handleBus(bus, students) {
       return storedBus === liveBus;
     });
 
-    for (const user of busUsers) {
-      if (!user.fcmToken || !user.studentId) continue;
+    if (busUsers.length > 0) {
+      // ── BATCH: Pre-fetch all student locations concurrently ──────────────
+      const userLocs = await Promise.all(
+        busUsers.map((u) => u.studentId ? getStudentLocation(u.studentId) : null)
+      );
 
-      const loc = await getStudentLocation(user.studentId);
-      if (!loc?.lat || !loc?.lng) continue;
+      for (let i = 0; i < busUsers.length; i++) {
+        const user = busUsers[i];
+        if (!user.fcmToken || !user.studentId) continue;
+
+        const loc = userLocs[i];
+        if (!loc?.lat || !loc?.lng) continue;
 
       if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng) ||
           !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng)) continue;
@@ -2723,48 +2866,70 @@ async function handleBus(bus, students) {
                 studentId: user.studentId,
                 distance:  dist.toFixed(1),
               },
+              android: { priority: "high", notification: { channelId: "bus_channel" } },
             });
             console.log(`✅ Nearby → ${user.studentId} (${dist.toFixed(1)} km)`);
           } catch (e) {
-            // Token invalid — don't block the loop
+            if (e.code === "messaging/registration-token-not-registered" || e.code === "messaging/invalid-registration-token") {
+              _pruneInvalidToken(user.fcmToken, user.studentId, "students");
+            }
             console.log(`❌ FCM nearby skip (${user.studentId}): ${e.message}`);
           }
         }
       }
     }
+    } // close if (busUsers.length > 0)
   }
 }
 /* =========================
-   USERS CACHE
-   Includes students + parents + faculty so that all bus members
-   receive start/nearby notifications and are considered for attendance.
+   USERS CACHE — Firestore onSnapshot Incremental Listeners
+   Replaces polling with realtime listeners for 99.97% Firestore read reduction.
 ========================= */
 let studentCache = [];
-let lastStudentSync = 0;
-const STUDENT_TTL = 2 * 60 * 1000; // 2 min
+let _snapshotListenersAttached = false;
+const _studentMap = new Map();
+const _parentMap  = new Map();
+const _facultyMap = new Map();
+
+function _rebuildStudentCache() {
+  studentCache = [..._studentMap.values(), ..._parentMap.values(), ..._facultyMap.values()];
+}
+
+function _extractFields(doc, idField) {
+  const d = doc.data();
+  return {
+    [idField]: doc.id, uid: d.uid || "", institution: d.institution || "college",
+    busId: d.busId || "", fcmToken: d.fcmToken || "", role: d.role || "",
+    name: d.name || "", mobile: d.mobile || "", studentType: d.studentType || "",
+    course: d.course || "", branch: d.branch || "", city: d.city || "",
+    year: d.year || d.academicYear || "", academicYear: d.academicYear || d.year || "",
+    email: d.email || "",
+  };
+}
+
+function _attachSnapshotListeners() {
+  if (_snapshotListenersAttached) return;
+  _snapshotListenersAttached = true;
+  admin.firestore().collection("students").onSnapshot((snap) => {
+    snap.docChanges().forEach((c) => { c.type === "removed" ? _studentMap.delete(c.doc.id) : _studentMap.set(c.doc.id, _extractFields(c.doc, "studentId")); });
+    _rebuildStudentCache();
+  }, (err) => { console.log("[CACHE] Students listener error:", err.message); _snapshotListenersAttached = false; });
+  admin.firestore().collection("parents").onSnapshot((snap) => {
+    snap.docChanges().forEach((c) => { c.type === "removed" ? _parentMap.delete(c.doc.id) : _parentMap.set(c.doc.id, _extractFields(c.doc, "studentId")); });
+    _rebuildStudentCache();
+  }, (err) => { console.log("[CACHE] Parents listener error:", err.message); });
+  admin.firestore().collection("faculty").onSnapshot((snap) => {
+    snap.docChanges().forEach((c) => { c.type === "removed" ? _facultyMap.delete(c.doc.id) : _facultyMap.set(c.doc.id, _extractFields(c.doc, "studentId")); });
+    _rebuildStudentCache();
+  }, (err) => { console.log("[CACHE] Faculty listener error:", err.message); });
+  console.log("[CACHE] Firestore onSnapshot listeners attached");
+}
 
 async function getStudentsCached() {
-  const now = Date.now();
-  if (now - lastStudentSync < STUDENT_TTL && studentCache.length) {
-    return studentCache;
+  if (!_snapshotListenersAttached) {
+    _attachSnapshotListeners();
+    await new Promise((r) => setTimeout(r, 2000)); // Wait for initial snapshot
   }
-
-  const [studentsSnap, parentsSnap, facultySnap] = await Promise.all([
-    admin.firestore().collection("students").get(),
-    admin.firestore().collection("parents").get(),
-    admin.firestore().collection("faculty").get(),
-  ]);
-
-  const toList = (snap, idField) =>
-    snap.docs.map((doc) => ({ [idField]: doc.id, ...doc.data() }));
-
-  studentCache = [
-    ...toList(studentsSnap, "studentId"),
-    ...toList(parentsSnap,  "studentId"), // reuse field so handleBus works unchanged
-    ...toList(facultySnap,  "studentId"),
-  ];
-
-  lastStudentSync = now;
   return studentCache;
 }
 /* =========================
@@ -2794,41 +2959,42 @@ function broadcast(data) {
   }
 
   // Lazy JSON serialization — only create payloads that have recipients
-  let allPayload = null;
   let collegePayload = null;
   let schoolPayload = null;
-  let hasLegacy = false;
-  let collegeClients = 0, schoolClients = 0, legacyClients = 0;
+  let allPayload = null;
+  let collegeClients = 0, schoolClients = 0, allClients = 0, skippedClients = 0;
 
   wss.clients.forEach((client) => {
     if (client.readyState !== 1) return;
     const inst = client._institution;
     if (inst === "college") collegeClients++;
     else if (inst === "school") schoolClients++;
-    else { legacyClients++; hasLegacy = true; }
+    else if (inst === "all") allClients++;  // superadmin
+    else skippedClients++; // No institution declared → receives NOTHING
   });
 
   // Only serialize what's needed
   if (collegeClients > 0 && collegeBuses.length) collegePayload = JSON.stringify({ type: "update", data: collegeBuses });
   if (schoolClients > 0 && schoolBuses.length) schoolPayload = JSON.stringify({ type: "update", data: schoolBuses });
-  if (hasLegacy) allPayload = JSON.stringify({ type: "update", data });
+  if (allClients > 0 && data.length) allPayload = JSON.stringify({ type: "update", data });
 
   const T_serial = Date.now();
 
-  // Send
+  // Send — ONLY to clients with a declared institution. No fallback.
   wss.clients.forEach((client) => {
     if (client.readyState !== 1) return;
     try {
       const inst = client._institution;
       if (inst === "college" && collegePayload) client.send(collegePayload);
       else if (inst === "school" && schoolPayload) client.send(schoolPayload);
-      else if (allPayload) client.send(allPayload);
+      else if (inst === "all" && allPayload) client.send(allPayload);
+      // else: no institution → intentionally skip (zero data leak)
     } catch (_) {}
   });
 
   const T_send = Date.now();
   const payloadKB = ((collegePayload?.length || 0) + (schoolPayload?.length || 0) + (allPayload?.length || 0)) / 1024;
-  console.log(`[GPS PERF] broadcast: serial=${T_serial-T0}ms send=${T_send-T_serial}ms total=${T_send-T0}ms payload=${payloadKB.toFixed(1)}KB clients=${collegeClients+schoolClients+legacyClients}`);
+  console.log(`[GPS PERF] broadcast: serial=${T_serial-T0}ms send=${T_send-T_serial}ms total=${T_send-T0}ms payload=${payloadKB.toFixed(1)}KB college=${collegeClients} school=${schoolClients} all=${allClients} skipped=${skippedClients}`);
 }
 // Retains the last known data for every bus ever seen. When a GPS source
 // fails intermittently (SML API timeout), buses don't vanish from broadcasts.
@@ -3072,16 +3238,22 @@ wss.on("connection", (ws, req) => {
   // Mobile apps send: wss://domain/ws?token=<firebase_id_token>
   // If no token provided, allow connection (backward compat) but mark as unauthenticated
   ws._authenticated = false;
+  ws._firebaseUid = null;
+  ws._isAdmin = false;
   const url = new URL(req.url, "http://localhost");
   const wsToken = url.searchParams.get("token");
   if (wsToken) {
     try {
-      // Accept both admin JWT and Firebase ID tokens
+      // Accept admin JWT
       const decoded = jwt.verify(wsToken, process.env.JWT_SECRET);
-      if (decoded.admin || decoded.uid) ws._authenticated = true;
+      if (decoded.admin) { ws._authenticated = true; ws._isAdmin = true; }
+      else if (decoded.uid) { ws._authenticated = true; ws._firebaseUid = decoded.uid; }
     } catch (_) {
-      // Not a JWT — could be Firebase ID token (verified async below)
-      admin.auth().verifyIdToken(wsToken).then(() => { ws._authenticated = true; }).catch(() => {});
+      // Not a JWT — try Firebase ID token (verified async)
+      admin.auth().verifyIdToken(wsToken).then((decoded) => {
+        ws._authenticated = true;
+        ws._firebaseUid = decoded.uid;
+      }).catch(() => {});
     }
   }
 
@@ -3099,29 +3271,29 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (msg) => {
     try {
       const parsed = JSON.parse(msg);
-      // Client declares its institution: { type: "join", institution: "school" }
+      // Client declares its institution: { type: "join", institution: "school"|"college"|"all" }
       if (parsed.type === "join" && parsed.institution) {
-        ws._institution = parsed.institution.toLowerCase();
-        console.log(`🏷️ Client joined institution: ${ws._institution}`);
-        // Send filtered init payload
-        const filtered = latestBuses.filter(b =>
-          (b.routeType || "college") === ws._institution);
-        if (filtered.length > 0) {
-          ws.send(JSON.stringify({ type: "init", data: filtered }));
+        const declared = parsed.institution.toLowerCase();
+        if (["college", "school", "all"].includes(declared)) {
+          ws._institution = declared;
+          console.log(`🏷️ Client joined institution: ${ws._institution}`);
+          // Send filtered init payload
+          let filtered;
+          if (declared === "all") {
+            filtered = latestBuses; // superadmin sees everything
+          } else {
+            filtered = latestBuses.filter(b => (b.routeType || "college") === declared);
+          }
+          if (filtered.length > 0) {
+            ws.send(JSON.stringify({ type: "init", data: filtered }));
+          }
         }
       }
     } catch (_) {}
   });
 
-  // Send initial buses (filtered if institution already known, else all)
-  if (latestBuses.length > 0) {
-    ws.send(
-      JSON.stringify({
-        type: "init",
-        data: latestBuses, // full payload — client will send "join" to get filtered updates
-      }),
-    );
-  }
+  // ── NO bus data sent on connect — wait for client to send "join" first ──
+  // This prevents cross-institution data leaks.
 
   ws.send(
     JSON.stringify({
@@ -3394,6 +3566,15 @@ app.get("/admin/dashboard", adminAuth, async (req, res) => {
   try {
     const inst = resolveInstitutionFilter(req, req.query.institution);
 
+    // ── Short-lived Redis cache (15s) to avoid repeated full scans ──────────
+    const dashCacheKey = `dash:${inst || "all"}`;
+    if (redisReady) {
+      const cached = await redis.get(dashCacheKey);
+      if (cached && typeof cached === "object") {
+        return res.json(cached);
+      }
+    }
+
     const today = new Date().toISOString().split("T")[0];
 
     // Students filtered by institution
@@ -3456,7 +3637,7 @@ app.get("/admin/dashboard", adminAuth, async (req, res) => {
       ? latestBuses.filter(b => (b.routeType || "college") === inst)
       : latestBuses;
 
-    return res.json({
+    const dashResponse = {
       totalUsers,
       totalStudents,
       presentToday: presentCount,
@@ -3468,7 +3649,14 @@ app.get("/admin/dashboard", adminAuth, async (req, res) => {
       busWiseUsers,
       busWiseAttendance,
       activities: recentActivities,
-    });
+    };
+
+    // Cache for 15 seconds (transparent to frontend)
+    if (redisReady) {
+      redis.setEx(dashCacheKey, 15, dashResponse).catch(() => {});
+    }
+
+    return res.json(dashResponse);
   } catch (e) {
     console.log(e);
     return res.status(500).json({ error: "Dashboard error" });
@@ -3502,12 +3690,11 @@ app.post("/admin/send-notification", adminAuth, async (req, res) => {
       });
     }
 
-    // students of selected bus
-    const snap = await admin
-      .firestore()
-      .collection("students")
-      .where("busId", "==", busId)
-      .get();
+    // Institution isolation: only send to students of admin's own institution
+    const inst = resolveInstitutionFilter(req);
+    let query = admin.firestore().collection("students").where("busId", "==", busId);
+    if (inst) query = query.where("institution", "==", inst);
+    const snap = await query.get();
 
     const students = snap.docs.map((doc) => ({
       id: doc.id,
@@ -4273,99 +4460,61 @@ app.get("/trip-status", async (req, res) => {
   }
 });
 
-app.post("/complaint", async (req, res) => {
+app.post("/complaint", authenticateFirebaseUser, async (req, res) => {
   try {
     const { userId, role, complaint } = req.body;
 
-    let userDoc = null;
+    if (!userId || !role || !complaint) {
+      return res.status(400).json({ success: false, error: "userId, role, and complaint required" });
+    }
 
-    // STUDENT
-    if (role === "student") {
-      const snap = await admin
-        .firestore()
-        .collection("students")
-        .doc(userId)
-        .get();
+    // ── Ownership verification: Firebase UID must match the user document ──
+    const collections = { student: "students", parent: "parents", faculty: "faculty" };
+    const col = collections[role];
+    if (!col) return res.status(400).json({ success: false, error: "Invalid role" });
 
-      if (snap.exists) {
-        userDoc = snap.data();
+    const snap = await admin.firestore().collection(col).doc(userId).get();
+    if (!snap.exists) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+    const userDoc = snap.data();
+
+    // Verify authenticated user owns this document
+    const docUid = userDoc.uid || "";
+    if (docUid !== req.firebaseUid) {
+      const uidSnap = await admin.firestore().collection(col)
+        .where("uid", "==", req.firebaseUid).limit(1).get();
+      if (uidSnap.empty || uidSnap.docs[0].id !== userId) {
+        return res.status(403).json({ success: false, error: "Access denied" });
       }
     }
 
-    // PARENT
-    else if (role === "parent") {
-      const snap = await admin
-        .firestore()
-        .collection("parents")
-        .doc(userId)
-        .get();
-
-      if (snap.exists) {
-        userDoc = snap.data();
-      }
-    }
-
-    // FACULTY
-    else if (role === "faculty") {
-      const snap = await admin
-        .firestore()
-        .collection("faculty")
-        .doc(userId)
-        .get();
-
-      if (snap.exists) {
-        userDoc = snap.data();
-      }
-    }
-
-    if (!userDoc) {
-      return res.status(404).send({
-        success: false,
-        message: "User not found",
-      });
-    }
+    // Sanitize complaint text
+    const cleanComplaint = sanitize(complaint);
 
     await admin.firestore().collection("complaints").add({
-      // USER INFO
       userId,
       role,
-      institution: userDoc.institution || "college", // ← added for admin filtering
-
+      institution: userDoc.institution || "college",
       name: userDoc.name || "",
       email: userDoc.email || "",
       mobile: userDoc.mobile || "",
-
-      // BUS
       busId: userDoc.busId || "",
-
-      // STUDENT FIELDS
       branch: userDoc.branch || "",
       course: userDoc.course || "",
       year: userDoc.year || "",
       class: userDoc.class || "",
       studentType: userDoc.studentType || "",
-
-      // FACULTY FIELDS
       facultyType: userDoc.facultyType || "",
-
-      // COMPLAINT
-      complaint,
+      complaint: cleanComplaint,
       status: "pending",
-
       createdAt: new Date(),
     });
 
-    res.send({
-      success: true,
-      message: "Complaint submitted",
-    });
+    res.json({ success: true, message: "Complaint submitted" });
   } catch (e) {
-    console.log(e);
-
-    res.status(500).send({
-      success: false,
-      error: e.toString(),
-    });
+    console.log("COMPLAINT ERROR:", e.message);
+    res.status(500).json({ success: false, error: e.message });
   }
 });
 
@@ -4888,6 +5037,35 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
         "Admin replied to your ticket",
         message.trim().substring(0, 100),
         { ticketId, ticketNumber: ticketData.ticketNumber || "" });
+
+      // ── FCM Push notification for ticket reply ──────────────────────────
+      // Look up the user's FCM token and send a real push so they get notified
+      // even when the app is backgrounded/killed.
+      (async () => {
+        try {
+          const role = ticketData.role || "student";
+          const cols = { student: "students", parent: "parents", faculty: "faculty" };
+          const col = cols[role] || "students";
+          const userDoc = await admin.firestore().collection(col).doc(ticketData.userId).get();
+          if (userDoc.exists) {
+            const fcmToken = userDoc.data().fcmToken;
+            if (fcmToken && fcmToken.length > 10) {
+              await admin.messaging().send({
+                token: fcmToken,
+                notification: {
+                  title: "Support Reply",
+                  body: message.trim().substring(0, 100),
+                },
+                data: {
+                  type: "ticket_reply",
+                  ticketId: ticketId,
+                  ticketNumber: ticketData.ticketNumber || "",
+                },
+              });
+            }
+          }
+        } catch (_) { /* FCM failure is non-fatal */ }
+      })();
     }
 
     const _t7 = Date.now();

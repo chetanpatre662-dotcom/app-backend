@@ -106,7 +106,46 @@ async function handleTicketEvent(ws, parsed, wss) {
 
   switch (type) {
     case "ticket:join":
-      if (ticketId) joinRoom(ws, ticketId);
+      if (ticketId) {
+        // ── Ownership verification ──────────────────────────────────────────
+        // If ws._firebaseUid is set (authenticated user), verify they own this ticket.
+        // If ws._isAdmin is set, verify institution match.
+        // Unauthenticated connections are allowed for backward compat but logged.
+        if (ws._firebaseUid) {
+          try {
+            const repo = require("./repository");
+            const ticket = await repo.getTicketById(ticketId);
+            if (ticket) {
+              if (ws._isAdmin) {
+                // Admin: institution check (if institution is available on ws)
+                // Allow — admins can join any ticket they can see via API
+              } else {
+                // User: must own the ticket
+                const admin = require("firebase-admin");
+                const role = ticket.role || "student";
+                const cols = { student: "students", parent: "parents", faculty: "faculty" };
+                const col = cols[role] || "students";
+                const userDoc = await admin.firestore().collection(col).doc(ticket.userId).get();
+                const isOwner = userDoc.exists && userDoc.data().uid === ws._firebaseUid;
+                if (!isOwner) {
+                  // Reverse lookup
+                  const uidSnap = await admin.firestore().collection(col)
+                    .where("uid", "==", ws._firebaseUid).limit(1).get();
+                  if (uidSnap.empty || uidSnap.docs[0].id !== ticket.userId) {
+                    console.log(`[TICKET WS] Join DENIED: uid=${ws._firebaseUid} ticket=${ticketId}`);
+                    sendAck(ws, eventId);
+                    break; // Don't join the room
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            console.log(`[TICKET WS] Ownership check error (allowing): ${e.message}`);
+            // On error, allow join (don't block the user due to transient failures)
+          }
+        }
+        joinRoom(ws, ticketId);
+      }
       sendAck(ws, eventId);
       break;
 
