@@ -1903,13 +1903,12 @@ function normalize(item) {
 const GPS_STATE = {
   LIVE:     "LIVE",       // 0–180 sec (0–3 min)
   UPDATING: "UPDATING",   // 181–300 sec (3–5 min)
-  DELAYED:  "DELAYED",    // 301–600 sec (5–10 min)
-  OFFLINE:  "OFFLINE",    // >600 sec (>10 min)
+  OFFLINE:  "OFFLINE",    // >300 sec (>5 min)
 };
 const GPS_THRESHOLD = {
   LIVE_MAX:     180,  // seconds (0–3 min)
   UPDATING_MAX: 300,  // seconds (3–5 min)
-  DELAYED_MAX:  600,  // seconds (5–10 min)
+  // OFFLINE: anything above UPDATING_MAX
 };
 
 // Track previous state per bus for state-change logging
@@ -1963,7 +1962,7 @@ function computeGpsReliability(provider, busId, parsedMs, serverNow) {
     if (gpsAgeSeconds < 0) gpsAgeSeconds = -1;
   }
 
-  // Determine state (no branching beyond necessary)
+  // Determine state (3 states only: LIVE, UPDATING, OFFLINE)
   let gpsState;
   if (gpsAgeSeconds < 0) {
     gpsState = GPS_STATE.OFFLINE;
@@ -1971,8 +1970,6 @@ function computeGpsReliability(provider, busId, parsedMs, serverNow) {
     gpsState = GPS_STATE.LIVE;
   } else if (gpsAgeSeconds <= GPS_THRESHOLD.UPDATING_MAX) {
     gpsState = GPS_STATE.UPDATING;
-  } else if (gpsAgeSeconds <= GPS_THRESHOLD.DELAYED_MAX) {
-    gpsState = GPS_STATE.DELAYED;
   } else {
     gpsState = GPS_STATE.OFFLINE;
   }
@@ -1994,7 +1991,7 @@ function computeGpsReliability(provider, busId, parsedMs, serverNow) {
 
   // Debug log — only for non-LIVE states (reduces log volume for healthy buses)
   if (gpsState !== GPS_STATE.LIVE) {
-    const thresholdRange = gpsState === GPS_STATE.UPDATING ? "181-300" : gpsState === GPS_STATE.DELAYED ? "301-600" : ">600";
+    const thresholdRange = gpsState === GPS_STATE.UPDATING ? "181-300" : ">300";
     console.log(`[GPS STATE] bus=${busId} age=${gpsAgeSeconds}s state=${gpsState} threshold=${thresholdRange} provider=${provider} gpsTimeIst=${lastGpsUpdateIst}`);
   }
 
@@ -3005,7 +3002,7 @@ setInterval(() => {
   const totalBuses = buses.length;
 
   // Count states
-  let live = 0, updating = 0, delayed = 0, offline = 0, unknownState = 0;
+  let live = 0, updating = 0, offline = 0, unknownState = 0;
   let totalAge = 0, ageCount = 0;
   let duplicates = 0, invalidTs = 0;
 
@@ -3013,7 +3010,6 @@ setInterval(() => {
     switch (bus.gpsState) {
       case "LIVE": live++; break;
       case "UPDATING": updating++; break;
-      case "DELAYED": delayed++; break;
       case "OFFLINE": offline++; break;
       default: unknownState++; break;
     }
@@ -3035,7 +3031,7 @@ setInterval(() => {
   console.log(
     `[GPS HEALTH] ` +
     `buses=${totalBuses} | ` +
-    `LIVE=${live} UPDATING=${updating} DELAYED=${delayed} OFFLINE=${offline} | ` +
+    `LIVE=${live} UPDATING=${updating} OFFLINE=${offline} | ` +
     `avgAge=${avgAge}s | ` +
     `invalidTs=${invalidTs} staleCached=${duplicates} | ` +
     `ws=${wsClients} | ` +
