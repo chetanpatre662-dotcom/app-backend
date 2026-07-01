@@ -1901,15 +1901,15 @@ function normalize(item) {
    Flutter displays these values — never calculates them.
 ========================= */
 const GPS_STATE = {
-  LIVE:     "LIVE",       // 0–25 sec
-  UPDATING: "UPDATING",   // 26–180 sec
-  DELAYED:  "DELAYED",    // 181–300 sec
-  OFFLINE:  "OFFLINE",    // >300 sec
+  LIVE:     "LIVE",       // 0–180 sec (0–3 min)
+  UPDATING: "UPDATING",   // 181–300 sec (3–5 min)
+  DELAYED:  "DELAYED",    // 301–600 sec (5–10 min)
+  OFFLINE:  "OFFLINE",    // >600 sec (>10 min)
 };
 const GPS_THRESHOLD = {
-  LIVE_MAX:     25,   // seconds
-  UPDATING_MAX: 180,  // seconds
-  DELAYED_MAX:  300,  // seconds
+  LIVE_MAX:     180,  // seconds (0–3 min)
+  UPDATING_MAX: 300,  // seconds (3–5 min)
+  DELAYED_MAX:  600,  // seconds (5–10 min)
 };
 
 // Track previous state per bus for state-change logging
@@ -1994,7 +1994,8 @@ function computeGpsReliability(provider, busId, parsedMs, serverNow) {
 
   // Debug log — only for non-LIVE states (reduces log volume for healthy buses)
   if (gpsState !== GPS_STATE.LIVE) {
-    console.log(`[GPS] provider=${provider} bus=${busId} gpsAge=${gpsAgeSeconds}s state=${gpsState} gpsTimeUtc=${lastGpsUpdateUtc} gpsTimeIst=${lastGpsUpdateIst} serverUtc=${new Date(serverNow).toISOString()} serverIst=${_formatIst(serverNow)}`);
+    const thresholdRange = gpsState === GPS_STATE.UPDATING ? "181-300" : gpsState === GPS_STATE.DELAYED ? "301-600" : ">600";
+    console.log(`[GPS STATE] bus=${busId} age=${gpsAgeSeconds}s state=${gpsState} threshold=${thresholdRange} provider=${provider} gpsTimeIst=${lastGpsUpdateIst}`);
   }
 
   return { gpsAgeSeconds, gpsState, lastGpsUpdateUtc, lastGpsUpdateIst };
