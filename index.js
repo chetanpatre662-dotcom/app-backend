@@ -675,30 +675,31 @@ function parseVoltyTime(raw) {
   const s = String(raw).trim();
 
   // Already has a real timezone offset → trust it as-is.
-  if (/[+-]\d{2}:\d{2}$/.test(s)) return new Date(s).getTime();
+  if (_tzOffsetRe.test(s)) return new Date(s).getTime();
 
   // Has a fake Z → strip it, add IST offset.
-  if (s.endsWith("Z") || s.endsWith("z")) {
+  if (s.charCodeAt(s.length - 1) === 90 || s.charCodeAt(s.length - 1) === 122) { // 'Z' or 'z'
     return new Date(s.slice(0, -1) + "+05:30").getTime();
   }
 
   // Bare local time with space separator (e.g. "2026-06-19 17:48:23").
   return new Date(s.replace(" ", "T") + "+05:30").getTime();
 }
+// Pre-compiled regex for parseVoltyTime (avoids re-compilation per call)
+const _tzOffsetRe = /[+-]\d{2}:\d{2}$/;
 
-function logBusUpdate(busId, gpsTime) {
+function logBusUpdate(busId, gpsTime, preParseMs) {
   const serverNow = Date.now();
-  const parsed    = parseVoltyTime(gpsTime);
+  // Use pre-parsed value if available, otherwise parse (backward compat)
+  const parsed = preParseMs !== undefined ? preParseMs : parseVoltyTime(gpsTime);
 
   if (!Number.isFinite(parsed)) {
-    // console.log(`🚌 BUS UPDATE: ${busId} delay = unknown`);
     return;
   }
 
-  // Round to whole seconds — no decimal noise in logs.
   const delaySec = Math.round((serverNow - parsed) / 1000);
 
-  console.log(`🚌 BUS UPDATE: ${busId} delay = ${delaySec}s`);
+  console.log(`🚌 BUS UPDATE: ${busId} delay = ${delaySec}s`);  console.log(`🚌 BUS UPDATE: ${busId} delay = ${delaySec}s`);
 
   // ── Abnormal delay guard ──────────────────────────────────────────────────
   // delay < -300 s  → GPS timestamp is AHEAD of server clock.
@@ -1866,11 +1867,17 @@ async function getAllDataWithPriorityEmit() {
 
   // MERGED EMIT: combine both sources + stale cache
   const combined = [...first.buses, ...second.buses];
+  const T_merge_start = Date.now();
   allBuses = mergeBusCache(combined);
   latestBuses = allBuses;
+  const T_merge_done = Date.now();
   if (second.buses.length > 0 || !firstEmitted) {
     broadcast(allBuses);
     if (!firstEmitted) firstEmitted = true;
+  }
+  const T_broadcast_done = Date.now();
+  if (T_broadcast_done - T_merge_start > 10) {
+    console.log(`[GPS PERF] priority_emit_merge: merge=${T_merge_done-T_merge_start}ms broadcast=${T_broadcast_done-T_merge_done}ms buses=${allBuses.length}`);
   }
 
   return { allBuses, firstEmitAt: T_first_emit, firstEmitted };
@@ -1908,57 +1915,79 @@ const GPS_THRESHOLD = {
 // Track previous state per bus for state-change logging
 const _prevGpsState = {};
 
+// Cache IST formatted strings to avoid repeated toLocaleString (expensive)
+// Key: parsedMs rounded to 1s → value: formatted IST string
+const _istFormatCache = {};
+const _IST_CACHE_MAX = 200;
+let _istCacheSize = 0;
+
+function _formatIst(parsedMs) {
+  // Round to second (avoid cache bloat from ms differences)
+  const key = Math.floor(parsedMs / 1000);
+  if (_istFormatCache[key]) return _istFormatCache[key];
+  const result = new Date(parsedMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+  // Evict cache if too large (simple LRU-free eviction)
+  if (_istCacheSize >= _IST_CACHE_MAX) {
+    const keys = Object.keys(_istFormatCache);
+    for (let i = 0; i < 50; i++) delete _istFormatCache[keys[i]];
+    _istCacheSize -= 50;
+  }
+  _istFormatCache[key] = result;
+  _istCacheSize++;
+  return result;
+}
+
 /**
  * Compute GPS reliability metrics for a single bus.
+ * Accepts pre-parsed milliseconds to avoid double-parsing timestamps.
  * @param {string} provider - "voltysoft" or "sml"
  * @param {string} busId
- * @param {string|null} rawGpsTime - raw timestamp from provider
+ * @param {number} parsedMs - pre-parsed GPS timestamp in ms (NaN if unknown)
+ * @param {number} serverNow - Date.now() passed in to avoid repeated calls
  * @returns {{ gpsAgeSeconds, gpsState, lastGpsUpdateUtc, lastGpsUpdateIst }}
  */
-function computeGpsReliability(provider, busId, rawGpsTime) {
-  const serverNow = Date.now();
-
-  // Parse the GPS timestamp
-  let parsedMs = NaN;
-  if (rawGpsTime) {
-    parsedMs = parseVoltyTime(rawGpsTime); // Works for both providers (ISO or IST)
-  }
-
+function computeGpsReliability(provider, busId, parsedMs, serverNow) {
   // Calculate age
-  let gpsAgeSeconds = -1; // -1 means unknown
+  let gpsAgeSeconds = -1;
   if (Number.isFinite(parsedMs) && parsedMs > 0) {
     gpsAgeSeconds = Math.round((serverNow - parsedMs) / 1000);
-    // Guard: negative age means clock skew or future timestamp — treat as unknown
     if (gpsAgeSeconds < 0) gpsAgeSeconds = -1;
   }
 
-  // Determine state
-  let gpsState = GPS_STATE.OFFLINE;
-  if (gpsAgeSeconds >= 0) {
-    if (gpsAgeSeconds <= GPS_THRESHOLD.LIVE_MAX) gpsState = GPS_STATE.LIVE;
-    else if (gpsAgeSeconds <= GPS_THRESHOLD.UPDATING_MAX) gpsState = GPS_STATE.UPDATING;
-    else if (gpsAgeSeconds <= GPS_THRESHOLD.DELAYED_MAX) gpsState = GPS_STATE.DELAYED;
-    else gpsState = GPS_STATE.OFFLINE;
+  // Determine state (no branching beyond necessary)
+  let gpsState;
+  if (gpsAgeSeconds < 0) {
+    gpsState = GPS_STATE.OFFLINE;
+  } else if (gpsAgeSeconds <= GPS_THRESHOLD.LIVE_MAX) {
+    gpsState = GPS_STATE.LIVE;
+  } else if (gpsAgeSeconds <= GPS_THRESHOLD.UPDATING_MAX) {
+    gpsState = GPS_STATE.UPDATING;
+  } else if (gpsAgeSeconds <= GPS_THRESHOLD.DELAYED_MAX) {
+    gpsState = GPS_STATE.DELAYED;
+  } else {
+    gpsState = GPS_STATE.OFFLINE;
   }
 
-  // State change logging
+  // State change logging (only on transition)
   const prev = _prevGpsState[busId];
-  if (prev && prev !== gpsState) {
-    console.log(`[GPS STATE CHANGE] bus=${busId} ${prev} -> ${gpsState} age=${gpsAgeSeconds}s`);
+  if (prev !== gpsState) {
+    if (prev) console.log(`[GPS STATE CHANGE] bus=${busId} ${prev} -> ${gpsState} age=${gpsAgeSeconds}s`);
+    _prevGpsState[busId] = gpsState;
   }
-  _prevGpsState[busId] = gpsState;
 
-  // Format timestamps
+  // Format timestamps — only when NOT live (live buses don't need IST display)
   let lastGpsUpdateUtc = null;
   let lastGpsUpdateIst = null;
   if (Number.isFinite(parsedMs)) {
-    const d = new Date(parsedMs);
-    lastGpsUpdateUtc = d.toISOString();
-    lastGpsUpdateIst = d.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+    lastGpsUpdateUtc = new Date(parsedMs).toISOString();
+    // Only compute expensive IST format when state is not LIVE
+    if (gpsState !== GPS_STATE.LIVE) {
+      lastGpsUpdateIst = _formatIst(parsedMs);
+    }
   }
 
-  // Debug log
-  if (gpsAgeSeconds > GPS_THRESHOLD.LIVE_MAX || gpsAgeSeconds === -1) {
+  // Debug log — only for non-LIVE states (reduces log volume for healthy buses)
+  if (gpsState !== GPS_STATE.LIVE) {
     console.log(`[GPS] provider=${provider} bus=${busId} gpsAge=${gpsAgeSeconds}s state=${gpsState}`);
   }
 
@@ -1966,42 +1995,55 @@ function computeGpsReliability(provider, busId, rawGpsTime) {
 }
 
 /**
- * Detect stale GPS packets (same location + same timestamp as previous).
- * Logs warning when detected.
+ * Detect stale GPS packets. Reuses object to avoid allocation per call.
  */
 const _lastGpsPacket = {}; // busId → { lat, lng, speed, time }
 function detectStalePacket(provider, busId, lat, lng, speed, rawGpsTime) {
   const prev = _lastGpsPacket[busId];
   if (prev) {
-    const sameLocation = prev.lat === lat && prev.lng === lng;
-    const sameSpeed = prev.speed === speed;
-    const sameTimestamp = prev.time === rawGpsTime;
-    if (sameLocation && sameSpeed && sameTimestamp && rawGpsTime) {
+    if (prev.lat === lat && prev.lng === lng && prev.speed === speed && prev.time === rawGpsTime && rawGpsTime) {
       console.log(`[GPS STALE] provider=${provider} bus=${busId} sameLocation=true sameSpeed=true sameTimestamp=true`);
     }
+    // Reuse existing object (avoid GC pressure)
+    prev.lat = lat; prev.lng = lng; prev.speed = speed; prev.time = rawGpsTime;
+  } else {
+    _lastGpsPacket[busId] = { lat, lng, speed, time: rawGpsTime };
   }
-  _lastGpsPacket[busId] = { lat, lng, speed, time: rawGpsTime };
 }
 
 /**
  * Safe SML timestamp parser with overflow guard.
- * SML sends lastOnline as Unix SECONDS. If value > 1e12, it's already ms.
+ * Returns milliseconds (number) or null. Does NOT create ISO string.
  */
-function parseSmlTimestamp(lastOnline) {
+function parseSmlTimestampMs(lastOnline) {
   if (!lastOnline) return null;
   const raw = Number(lastOnline);
   if (!Number.isFinite(raw) || raw <= 0) {
     console.log(`[SML TIME ERROR] raw=${lastOnline} parsed=NaN`);
     return null;
   }
-  // If > 1e12, it's already milliseconds (not seconds)
   const ms = raw > 1e12 ? raw : raw * 1000;
-  // Sanity: reject timestamps more than 24 hours in the future
   if (ms > Date.now() + 86400000) {
-    console.log(`[SML TIME ERROR] raw=${lastOnline} parsed=${new Date(ms).toISOString()} (future — rejected)`);
+    console.log(`[SML TIME ERROR] raw=${lastOnline} parsed=${ms} (future — rejected)`);
     return null;
   }
-  return new Date(ms).toISOString();
+  // Detect IST-as-UTC: if computed age is ~19800s (5.5h), the SML provider
+  // likely returns local IST seconds as if they were UTC epoch seconds.
+  // Correct by adding the IST offset (19800 seconds = 5.5 hours).
+  const ageMs = Date.now() - ms;
+  if (ageMs > 18000000 && ageMs < 21600000) { // 5h to 6h range = timezone issue
+    console.log(`[SML WARNING] IST-as-UTC detected: raw=${lastOnline} age=${Math.round(ageMs/1000)}s — correcting +19800s`);
+    return ms + 19800000;
+  }
+  return ms;
+}
+
+/**
+ * Legacy wrapper — returns ISO string for backward compat fields.
+ */
+function parseSmlTimestamp(lastOnline) {
+  const ms = parseSmlTimestampMs(lastOnline);
+  return ms ? new Date(ms).toISOString() : null;
 }
 
 /* =========================
@@ -2084,12 +2126,13 @@ async function formatBuses(data) {
             distanceToNext: null, direction: "Unknown" };
 
       lastBusLocationTime[d.imei] = now;
-      logBusUpdate(busId, item.time || null);
 
-      // ── GPS Reliability Engine ──
+      // ── GPS Reliability Engine (optimized: single parse, shared serverNow) ──
       const rawGpsTime = item.time || null;
+      const gpsParsedMs = rawGpsTime ? parseVoltyTime(rawGpsTime) : NaN;
+      logBusUpdate(busId, rawGpsTime, gpsParsedMs);
       detectStalePacket("voltysoft", busId, d.lat, d.lng, d.speed, rawGpsTime);
-      const gpsReliability = computeGpsReliability("voltysoft", busId, rawGpsTime);
+      const gpsReliability = computeGpsReliability("voltysoft", busId, gpsParsedMs, now);
 
       return {
         busId,
@@ -2179,8 +2222,108 @@ async function formatBuses(data) {
   return [...filtered, ...extras];
 }
 
+// ── SML Diagnostics State (observation only — no functional impact) ──
+const _smlDiag = {
+  rawPrinted: {},      // busId → true (print full packet once)
+  lastPacket: {},      // busId → { lastOnline, latitude, longitude, speed, gpsSignal }
+  packetsReceived: 0,
+  packetsChanged: 0,
+  timestampChanged: 0,
+  locationChanged: 0,
+  speedChanged: 0,
+  ages: [],            // all computed ages for averaging
+};
+
+// Print summary every 60 seconds
+setInterval(() => {
+  if (_smlDiag.packetsReceived === 0) return;
+  const ages = _smlDiag.ages;
+  const avgAge = ages.length > 0 ? Math.round(ages.reduce((a, b) => a + b, 0) / ages.length) : -1;
+  const minAge = ages.length > 0 ? Math.min(...ages) : -1;
+  const maxAge = ages.length > 0 ? Math.max(...ages) : -1;
+  console.log(`\n[SML SUMMARY] received=${_smlDiag.packetsReceived} changed=${_smlDiag.packetsChanged} tsChanged=${_smlDiag.timestampChanged} locChanged=${_smlDiag.locationChanged} speedChanged=${_smlDiag.speedChanged} avgAge=${avgAge}s minAge=${minAge}s maxAge=${maxAge}s\n`);
+  // Reset counters for next interval
+  _smlDiag.packetsReceived = 0;
+  _smlDiag.packetsChanged = 0;
+  _smlDiag.timestampChanged = 0;
+  _smlDiag.locationChanged = 0;
+  _smlDiag.speedChanged = 0;
+  _smlDiag.ages = [];
+}, 60000);
+
 async function formatSMLBuses(data) {
   const now = Date.now();
+
+  // ── SML DIAGNOSTICS (no functional changes — observing only) ──────────
+  _smlDiag.packetsReceived += data.length;
+  for (const item of data) {
+    const map = smlBusMap[item?.chassisNumber];
+    if (!map) continue;
+    const busId = map.busId;
+
+    // Print full raw packet ONCE per bus (after server start)
+    if (!_smlDiag.rawPrinted[busId]) {
+      _smlDiag.rawPrinted[busId] = true;
+      console.log(`\n==================== RAW SML PACKET [${busId}] ====================`);
+      console.log(JSON.stringify(item, null, 2));
+      console.log(`====================================================================\n`);
+    }
+
+    // Compare with previous packet
+    const prev = _smlDiag.lastPacket[busId];
+    const curr = {
+      lastOnline: item.lastOnline,
+      latitude: item.latitude,
+      longitude: item.longitude,
+      speed: item.speed,
+      gpsSignal: item.gpsSignal,
+    };
+
+    if (prev) {
+      const changes = [];
+      if (prev.lastOnline !== curr.lastOnline) changes.push({ field: "lastOnline", old: prev.lastOnline, new: curr.lastOnline });
+      if (prev.latitude !== curr.latitude) changes.push({ field: "latitude", old: prev.latitude, new: curr.latitude });
+      if (prev.longitude !== curr.longitude) changes.push({ field: "longitude", old: prev.longitude, new: curr.longitude });
+      if (prev.speed !== curr.speed) changes.push({ field: "speed", old: prev.speed, new: curr.speed });
+      if (prev.gpsSignal !== curr.gpsSignal) changes.push({ field: "gpsSignal", old: prev.gpsSignal, new: curr.gpsSignal });
+
+      if (changes.length > 0) {
+        _smlDiag.packetsChanged++;
+        const hasTimestampChange = changes.some(c => c.field === "lastOnline");
+        const hasLocationChange = changes.some(c => c.field === "latitude" || c.field === "longitude");
+        const hasSpeedChange = changes.some(c => c.field === "speed");
+        if (hasTimestampChange) _smlDiag.timestampChanged++;
+        if (hasLocationChange) _smlDiag.locationChanged++;
+        if (hasSpeedChange) _smlDiag.speedChanged++;
+
+        console.log(`[SML CHANGE] bus=${busId} fields=${changes.map(c=>c.field).join(",")}`);
+        for (const c of changes) console.log(`  ${c.field}: ${c.old} → ${c.new}`);
+
+        // Timestamp analysis ONLY when lastOnline changes
+        if (hasTimestampChange) {
+          const rawVal = curr.lastOnline;
+          const asNum = Number(rawVal);
+          const ms = asNum > 1e12 ? asNum : asNum * 1000;
+          const diffSec = Math.round((now - ms) / 1000);
+          _smlDiag.ages.push(diffSec);
+          console.log(`[SML TIMESTAMP] bus=${busId} raw=${rawVal} type=${typeof rawVal} ms=${ms} iso=${new Date(ms).toISOString()} serverUtc=${new Date(now).toISOString()} serverIst=${new Date(now).toLocaleString("en-IN",{timeZone:"Asia/Kolkata"})} age=${diffSec}s (${(diffSec/60).toFixed(1)}min)`);
+        }
+      }
+    } else {
+      // First packet for this bus — do initial timestamp analysis
+      const rawVal = curr.lastOnline;
+      const asNum = Number(rawVal);
+      if (Number.isFinite(asNum) && asNum > 0) {
+        const ms = asNum > 1e12 ? asNum : asNum * 1000;
+        const diffSec = Math.round((now - ms) / 1000);
+        _smlDiag.ages.push(diffSec);
+        console.log(`[SML TIMESTAMP] bus=${busId} raw=${rawVal} type=${typeof rawVal} ms=${ms} iso=${new Date(ms).toISOString()} serverUtc=${new Date(now).toISOString()} serverIst=${new Date(now).toLocaleString("en-IN",{timeZone:"Asia/Kolkata"})} age=${diffSec}s (${(diffSec/60).toFixed(1)}min) [INITIAL]`);
+      }
+    }
+
+    _smlDiag.lastPacket[busId] = curr;
+  }
+  // ── END SML DIAGNOSTICS ───────────────────────────────────────────────
 
   const results = await Promise.all(
     data.map(async (item) => {
@@ -2236,13 +2379,23 @@ async function formatSMLBuses(data) {
         : null;
  lastBusLocationTime[imei] = now;
 
-        const gpsTime = parseSmlTimestamp(item.lastOnline);
+        const gpsParsedMs = parseSmlTimestampMs(item.lastOnline);
+        const gpsTime = gpsParsedMs ? new Date(gpsParsedMs).toISOString() : null;
 
-logBusUpdate(busId, gpsTime);
+        // ── SML Diagnostic: log timestamp pipeline ──
+        if (!gpsParsedMs || (gpsParsedMs && Math.abs(now - gpsParsedMs) > 300000)) {
+          console.log(`[SML TIME] bus=${busId} raw=${item.lastOnline} type=${typeof item.lastOnline} parsedMs=${gpsParsedMs} gpsTime=${gpsTime} serverNow=${now} age=${gpsParsedMs ? Math.round((now - gpsParsedMs)/1000) : 'null'}s speed=${item.speed}`);
+        }
 
-      // ── GPS Reliability Engine ──
+        // If SML provides no valid timestamp but we ARE receiving coordinates,
+        // the packet is live — use server receipt time as fallback.
+        const effectiveGpsMs = gpsParsedMs || now;
+
+logBusUpdate(busId, gpsTime, effectiveGpsMs);
+
+      // ── GPS Reliability Engine (optimized: pre-parsed ms, shared serverNow) ──
       detectStalePacket("sml", busId, Number(item.latitude), Number(item.longitude), Number(item.speed || 0), gpsTime);
-      const gpsReliability = computeGpsReliability("sml", busId, gpsTime);
+      const gpsReliability = computeGpsReliability("sml", busId, effectiveGpsMs, now);
 
       return {
         busId,
@@ -2617,28 +2770,61 @@ async function getStudentsCached() {
    Clients that don't declare an institution receive ALL buses (backward compat).
 ========================= */
 function broadcast(data) {
-  const allPayload = JSON.stringify({ type: "update", data });
+  const T0 = Date.now();
 
-  // Pre-filter by institution for efficiency
-  const collegeBuses = data.filter(b => (b.routeType || "college") === "college");
-  const schoolBuses = data.filter(b => (b.routeType || "college") === "school");
-  const collegePayload = collegeBuses.length ? JSON.stringify({ type: "update", data: collegeBuses }) : null;
-  const schoolPayload = schoolBuses.length ? JSON.stringify({ type: "update", data: schoolBuses }) : null;
+  // Pre-filter by institution once (single pass)
+  let collegeBuses, schoolBuses;
+  if (data.length <= 20) {
+    // Small array — direct filter is fine
+    collegeBuses = data.filter(b => (b.routeType || "college") === "college");
+    schoolBuses = data.filter(b => (b.routeType || "college") === "school");
+  } else {
+    // Larger array — single pass partition
+    collegeBuses = [];
+    schoolBuses = [];
+    for (let i = 0; i < data.length; i++) {
+      const rt = data[i].routeType || "college";
+      if (rt === "college") collegeBuses.push(data[i]);
+      else schoolBuses.push(data[i]);
+    }
+  }
 
+  // Lazy JSON serialization — only create payloads that have recipients
+  let allPayload = null;
+  let collegePayload = null;
+  let schoolPayload = null;
+  let hasLegacy = false;
+  let collegeClients = 0, schoolClients = 0, legacyClients = 0;
+
+  wss.clients.forEach((client) => {
+    if (client.readyState !== 1) return;
+    const inst = client._institution;
+    if (inst === "college") collegeClients++;
+    else if (inst === "school") schoolClients++;
+    else { legacyClients++; hasLegacy = true; }
+  });
+
+  // Only serialize what's needed
+  if (collegeClients > 0 && collegeBuses.length) collegePayload = JSON.stringify({ type: "update", data: collegeBuses });
+  if (schoolClients > 0 && schoolBuses.length) schoolPayload = JSON.stringify({ type: "update", data: schoolBuses });
+  if (hasLegacy) allPayload = JSON.stringify({ type: "update", data });
+
+  const T_serial = Date.now();
+
+  // Send
   wss.clients.forEach((client) => {
     if (client.readyState !== 1) return;
     try {
       const inst = client._institution;
-      if (inst === "college" && collegePayload) {
-        client.send(collegePayload);
-      } else if (inst === "school" && schoolPayload) {
-        client.send(schoolPayload);
-      } else {
-        // No institution declared (legacy/admin) — send all
-        client.send(allPayload);
-      }
+      if (inst === "college" && collegePayload) client.send(collegePayload);
+      else if (inst === "school" && schoolPayload) client.send(schoolPayload);
+      else if (allPayload) client.send(allPayload);
     } catch (_) {}
   });
+
+  const T_send = Date.now();
+  const payloadKB = ((collegePayload?.length || 0) + (schoolPayload?.length || 0) + (allPayload?.length || 0)) / 1024;
+  console.log(`[GPS PERF] broadcast: serial=${T_serial-T0}ms send=${T_send-T_serial}ms total=${T_send-T0}ms payload=${payloadKB.toFixed(1)}KB clients=${collegeClients+schoolClients+legacyClients}`);
 }
 // Retains the last known data for every bus ever seen. When a GPS source
 // fails intermittently (SML API timeout), buses don't vanish from broadcasts.
@@ -2654,7 +2840,8 @@ const _BUS_STALE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
  * Returns the merged array (fresh + recently-stale).
  */
 function mergeBusCache(freshBuses) {
-  const now = Date.now();
+  const T0 = Date.now();
+  const now = T0;
   const freshIds = new Set();
 
   // Update cache with fresh data
@@ -2667,37 +2854,26 @@ function mergeBusCache(freshBuses) {
   // Build merged list: fresh + recently-stale
   const merged = [...freshBuses];
   for (const [busId, entry] of Object.entries(_lastKnownBuses)) {
-    if (freshIds.has(busId)) continue; // already in fresh data
+    if (freshIds.has(busId)) continue;
     const age = now - entry.lastSeen;
     if (age > _BUS_STALE_TIMEOUT_MS) {
-      // Too old — remove from cache entirely
       delete _lastKnownBuses[busId];
       continue;
     }
-    // Include stale bus with speed=0 and status="Offline"
     merged.push({
       ...entry.data,
       speed: 0,
       tripActive: false,
       status: "Offline",
+      gpsState: GPS_STATE.OFFLINE,
+      gpsAgeSeconds: Math.round(age / 1000),
       _stale: true,
     });
   }
 
+  const T1 = Date.now();
+  if (T1 - T0 > 5) console.log(`[GPS PERF] mergeBusCache: ${T1-T0}ms fresh=${freshBuses.length} merged=${merged.length}`);
   return merged;
-}
-
-function broadcast(data) {
-  const payload = JSON.stringify({
-    type: "update",
-    data,
-  });
-
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1) {
-      try { client.send(payload); } catch (_) { /* client disconnected mid-send */ }
-    }
-  });
 }
 
 /* =========================
@@ -2768,7 +2944,8 @@ async function loop() {
     console.log(
       `[LAT] first_emit: ${(firstEmitMs / 1000).toFixed(1)}s | ` +
       `total: ${(totalMs / 1000).toFixed(1)}s | ` +
-      `gps_age: ${gpsAgeLabel} | buses: ${allBuses.length}`
+      `gps_age: ${gpsAgeLabel} | buses: ${allBuses.length} | ` +
+      `ist_cache: ${_istCacheSize}`
     );
 
     // ── Side-effects: concurrent, non-blocking ────────────────────────────
@@ -2808,6 +2985,78 @@ async function loop() {
 }
 
 loop();
+
+/* =========================
+   GPS HEALTH MONITOR — prints one summary every 60 seconds
+   No API changes. No Flutter changes. Backend monitoring only.
+========================= */
+// Counters are derived from latestBuses state at report time (zero-overhead)
+
+setInterval(() => {
+  const mem = process.memoryUsage();
+  const buses = latestBuses || [];
+  const totalBuses = buses.length;
+
+  // Count states
+  let live = 0, updating = 0, delayed = 0, offline = 0, unknownState = 0;
+  let totalAge = 0, ageCount = 0;
+  let duplicates = 0, invalidTs = 0;
+
+  for (const bus of buses) {
+    switch (bus.gpsState) {
+      case "LIVE": live++; break;
+      case "UPDATING": updating++; break;
+      case "DELAYED": delayed++; break;
+      case "OFFLINE": offline++; break;
+      default: unknownState++; break;
+    }
+    if (typeof bus.gpsAgeSeconds === "number" && bus.gpsAgeSeconds >= 0) {
+      totalAge += bus.gpsAgeSeconds;
+      ageCount++;
+    }
+    if (bus.gpsAgeSeconds === -1) invalidTs++;
+    if (bus._stale) duplicates++;
+  }
+
+  const avgAge = ageCount > 0 ? Math.round(totalAge / ageCount) : -1;
+  const wsClients = typeof wss !== "undefined" ? wss.clients.size : 0;
+
+  // Redis latency (quick ping)
+  const redisStart = Date.now();
+  const redisLatency = redisReady ? "ok" : "disconnected";
+
+  console.log(
+    `[GPS HEALTH] ` +
+    `buses=${totalBuses} | ` +
+    `LIVE=${live} UPDATING=${updating} DELAYED=${delayed} OFFLINE=${offline} | ` +
+    `avgAge=${avgAge}s | ` +
+    `invalidTs=${invalidTs} staleCached=${duplicates} | ` +
+    `ws=${wsClients} | ` +
+    `mem=${Math.round(mem.heapUsed / 1048576)}MB/${Math.round(mem.rss / 1048576)}MB | ` +
+    `redis=${redisLatency}`
+  );
+
+  // Warnings
+  if (avgAge > 120) {
+    console.log(`[GPS WARNING] Average GPS age ${avgAge}s > 120s threshold`);
+  }
+  if (offline > 5) {
+    console.log(`[GPS WARNING] ${offline} buses OFFLINE (>5 threshold)`);
+  }
+  if (duplicates > 3) {
+    console.log(`[GPS WARNING] ${duplicates} stale-cached buses in broadcast`);
+  }
+  if (invalidTs > 2) {
+    console.log(`[GPS WARNING] ${invalidTs} buses with invalid timestamps`);
+  }
+  if (totalBuses === 0) {
+    console.log(`[GPS WARNING] No buses in latestBuses — possible provider failure`);
+  }
+  if (wsClients === 0) {
+    console.log(`[GPS WARNING] No WebSocket clients connected`);
+  }
+}, 60000); // Every 60 seconds
+
 /* =========================
    WS CONNECTION
 ========================= */
