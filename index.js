@@ -6619,10 +6619,17 @@ const upload = multer({
 // ══════════════════════════════════════════════════════════════════════════════
 const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID;
 const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY;
-const CASHFREE_ENV = (process.env.CASHFREE_ENV || "PRODUCTION").toUpperCase();
+const CASHFREE_ENV = (process.env.CASHFREE_ENV || "SANDBOX").toUpperCase();
 const CASHFREE_BASE_URL = CASHFREE_ENV === "PRODUCTION"
   ? "https://api.cashfree.com/pg"
   : "https://sandbox.cashfree.com/pg";
+
+console.log("==========================");
+console.log("  Cashfree Environment");
+console.log(`  Environment : ${CASHFREE_ENV}`);
+console.log(`  Base URL    : ${CASHFREE_BASE_URL}`);
+console.log(`  App ID      : ${CASHFREE_APP_ID ? CASHFREE_APP_ID.substring(0, 16) + "..." : "NOT SET"}`);
+console.log("==========================");
 
 // GET /api/payment/upload-price — Check if upload is free or requires payment
 app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
