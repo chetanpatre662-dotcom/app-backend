@@ -6641,12 +6641,14 @@ app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, a
     const currentYear = new Date().getFullYear();
     let count = d.photoChangeCount || 0;
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    // Pricing: 1st & 2nd = free, 3rd = ₹10, 4th+ = ₹15
-    if (count < 2) {
-      return res.json({ success: true, free: true, uploadNumber: count + 1, remaining: 2 - count });
+    const allowed = d.allowedPhotoUploads ?? 2;
+    // If user still has uploads available (free or paid), no payment needed
+    if (count < allowed) {
+      return res.json({ success: true, free: true, uploadNumber: count + 1, photoChangeCount: count, allowedPhotoUploads: allowed });
     }
+    // Pricing: 3rd upload = ₹10, 4th+ = ₹15
     const price = count === 2 ? 10 : 15;
-    return res.json({ success: true, free: false, price, uploadNumber: count + 1 });
+    return res.json({ success: true, free: false, price, uploadNumber: count + 1, photoChangeCount: count, allowedPhotoUploads: allowed });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
   }
@@ -6667,12 +6669,13 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
     const currentYear = new Date().getFullYear();
     let count = d.photoChangeCount || 0;
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    console.log("[CF CREATE-ORDER] Student:", studentDoc.id, "photoChangeCount:", count);
+    const allowed = d.allowedPhotoUploads ?? 2;
+    console.log("[CF CREATE-ORDER] Student:", studentDoc.id, "photoChangeCount:", count, "allowedPhotoUploads:", allowed);
 
-    // If free uploads remain, allow without payment
-    if (count < 2) {
-      console.log("[CF CREATE-ORDER] Free upload. count:", count);
-      return res.json({ success: true, free: true, message: "Free upload available" });
+    // If uploads still available (free or previously paid), no new payment needed
+    if (count < allowed) {
+      console.log("[CF CREATE-ORDER] Upload available without payment. count:", count, "allowed:", allowed);
+      return res.json({ success: true, free: true, message: "Upload available", photoChangeCount: count, allowedPhotoUploads: allowed });
     }
     const price = count === 2 ? 10 : 15;
     console.log("[CF CREATE-ORDER] Price:", price, "uploadNumber:", count + 1);
@@ -6803,19 +6806,23 @@ app.post("/api/payment/verify", paymentLimiter, authenticateFirebaseUser, async 
       return res.json({ success: true, verified: true, message: "Already verified" });
     }
 
-    // Update payment record
-    await payDoc.ref.update({
-      status: "verified",
-      cfPaymentId: cfOrder.cf_order_id || "",
-      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // Grant paid upload
+    // Use transaction to prevent double-increment race with webhook
     const studentId = payDoc.data().studentId;
-    await admin.firestore().collection("students").doc(studentId).update({
-      paidUploadAvailable: true,
-      lastPaymentId: orderId,
-      lastPaymentAmount: payDoc.data().amount,
+    const payAmount = payDoc.data().amount;
+    await admin.firestore().runTransaction(async (tx) => {
+      const freshPay = await tx.get(payDoc.ref);
+      if (freshPay.data().creditGranted) return; // Already granted by webhook — skip increment
+      tx.update(payDoc.ref, {
+        status: "verified",
+        creditGranted: true,
+        cfPaymentId: cfOrder.cf_order_id || "",
+        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      tx.update(admin.firestore().collection("students").doc(studentId), {
+        allowedPhotoUploads: admin.firestore.FieldValue.increment(1),
+        lastPaymentId: orderId,
+        lastPaymentAmount: payAmount,
+      });
     });
 
     // Notify student
@@ -6868,18 +6875,23 @@ app.post("/api/payment/cashfree-webhook", async (req, res) => {
         .where("orderId", "==", payload.order_id).limit(1).get();
       if (!paySnap.empty) {
         const payDoc = paySnap.docs[0];
-        if (payDoc.data().status !== "verified") {
-          // Auto-verify via webhook (backup for client-side verify failures)
-          await payDoc.ref.update({
+        // Use transaction to prevent double-increment race with verify endpoint
+        await admin.firestore().runTransaction(async (tx) => {
+          const freshPay = await tx.get(payDoc.ref);
+          if (freshPay.data().creditGranted) return; // Already granted by verify — skip
+          tx.update(payDoc.ref, {
             status: "verified",
+            creditGranted: true,
             paymentId: payload.id,
             webhookVerified: true,
             verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-          const studentId = payDoc.data().studentId;
-          await admin.firestore().collection("students").doc(studentId).update({ paidUploadAvailable: true });
+          const studentId = freshPay.data().studentId;
+          tx.update(admin.firestore().collection("students").doc(studentId), {
+            allowedPhotoUploads: admin.firestore.FieldValue.increment(1),
+          });
           console.log("[WEBHOOK] Auto-verified payment for:", studentId);
-        }
+        });
       }
     } else if (eventType === "payment.failed") {
       const paySnap = await admin.firestore().collection("payments")
@@ -6944,9 +6956,11 @@ app.post("/admin/payment/refund", adminAuth, async (req, res) => {
       refundInitiatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    // Revoke the paid upload if it hasn't been used
+    // Revoke the paid upload (decrement allowedPhotoUploads)
     const studentId = payDoc.data().studentId;
-    await admin.firestore().collection("students").doc(studentId).update({ paidUploadAvailable: false });
+    await admin.firestore().collection("students").doc(studentId).update({
+      allowedPhotoUploads: admin.firestore.FieldValue.increment(-1),
+    });
 
     // Notify student
     await createUserNotification(studentId, "payment", "Refund Initiated",
@@ -7091,25 +7105,24 @@ app.post("/api/payment/retry", paymentLimiter, authenticateFirebaseUser, async (
 app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFirebaseUser, async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No photo file provided" });
-    // Find student by VERIFIED UID (from middleware � cannot be forged)
+    // Find student by VERIFIED UID (from middleware — cannot be forged)
     const snap = await admin.firestore().collection("students")
       .where("uid", "==", req.firebaseUid).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "Student not found for this account" });
     const studentDoc = snap.docs[0];
     const studentId = studentDoc.id;
     const d = studentDoc.data();
-    // SERVER-SIDE limit enforcement: 2 free per year, beyond that requires payment
+    // SERVER-SIDE limit enforcement using allowedPhotoUploads counter
     const currentYear = new Date().getFullYear();
     let count = d.photoChangeCount || 0;
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    if (count >= 2) {
-      // Check if a paid upload was unlocked
-      if (!d.paidUploadAvailable) {
-        return res.status(429).json({ error: "Photo change limit reached. Payment required.", remaining: 0 });
-      }
-      // Consume the paid upload token
-      await admin.firestore().collection("students").doc(studentId).update({
-        paidUploadAvailable: false,
+    // allowedPhotoUploads defaults to 2 (free uploads), incremented by each payment
+    const allowed = d.allowedPhotoUploads ?? 2;
+    if (count >= allowed) {
+      return res.status(429).json({
+        error: "Photo change limit reached. Payment required.",
+        photoChangeCount: count,
+        allowedPhotoUploads: allowed,
       });
     }
     // Upload via Admin SDK ONLY (client has zero Storage access)
@@ -7124,20 +7137,27 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
       .resize({ width: 1080, withoutEnlargement: true }) // max 1080px wide
       .jpeg({ quality: 80 }) // convert to JPEG, quality 80
       .toBuffer();
-    console.log(`[PHOTO] Compressed: ${req.file.buffer.length} ? ${compressed.length} bytes`);
+    console.log(`[PHOTO] Compressed: ${req.file.buffer.length} → ${compressed.length} bytes`);
     await file.save(compressed, { metadata: { contentType: "image/jpeg" }, public: false });
-    // Generate signed URL (7 days � refreshed via /photo-url endpoint)
+    // Generate signed URL (7 days — refreshed via /photo-url endpoint)
     const [signedUrl] = await file.getSignedUrl({ action: "read", expires: Date.now() + 7*24*60*60*1000 });
-    // Update Firestore atomically
+    // Upload succeeded — NOW increment photoChangeCount (credit NOT consumed, allowedPhotoUploads stays)
     count++;
-    await admin.firestore().collection("students").doc(studentId).update({
+    const updateData = {
       passPhotoUrl: signedUrl,
       passPhotoPath: filePath,
       photoChangeCount: count,
       photoChangeResetYear: currentYear,
       photoUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    await admin.firestore().collection("students").doc(studentId).update(updateData);
+    console.log(`[PHOTO UPLOAD] ✅ Success. studentId=${studentId} count=${count}/${allowed}`);
+    return res.json({
+      success: true,
+      photoUrl: signedUrl,
+      photoChangeCount: count,
+      allowedPhotoUploads: allowed,
     });
-    return res.json({ success: true, photoUrl: signedUrl, remaining: 2 - count });
   } catch (e) {
     console.log("PHOTO UPLOAD ERR:", e.message);
     return res.status(500).json({ error: e.message });
