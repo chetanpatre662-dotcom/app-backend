@@ -6647,20 +6647,28 @@ app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, a
 
 // POST /api/payment/create-order — Create Cashfree order for paid upload
 app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
+  console.log("[CF CREATE-ORDER] ▶ Request received. uid:", req.firebaseUid);
   try {
     const snap = await admin.firestore().collection("students")
       .where("uid", "==", req.firebaseUid).limit(1).get();
-    if (snap.empty) return res.status(404).json({ success: false, error: "Student not found" });
+    if (snap.empty) {
+      console.log("[CF CREATE-ORDER] ❌ Student not found for uid:", req.firebaseUid);
+      return res.status(404).json({ success: false, error: "Student not found" });
+    }
     const studentDoc = snap.docs[0];
     const d = studentDoc.data();
     const currentYear = new Date().getFullYear();
     let count = d.photoChangeCount || 0;
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
+    console.log("[CF CREATE-ORDER] Student:", studentDoc.id, "photoChangeCount:", count);
+
     // If free uploads remain, allow without payment
     if (count < 2) {
+      console.log("[CF CREATE-ORDER] Free upload. count:", count);
       return res.json({ success: true, free: true, message: "Free upload available" });
     }
     const price = count === 2 ? 10 : 15;
+    console.log("[CF CREATE-ORDER] Price:", price, "uploadNumber:", count + 1);
 
     // Duplicate protection: if a pending order already exists for this upload number, return it
     const pendingSnap = await admin.firestore().collection("payments")
@@ -6671,6 +6679,7 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
       .get();
     if (!pendingSnap.empty) {
       const existing = pendingSnap.docs[0].data();
+      console.log("[CF CREATE-ORDER] Reusing existing order:", existing.orderId, "sessionId:", existing.paymentSessionId?.substring(0, 30));
       return res.json({
         success: true, free: false,
         orderId: existing.orderId,
@@ -6683,7 +6692,7 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
 
     // Create Cashfree order
     const cfOrderId = `photo_${studentDoc.id}_${Date.now()}`;
-    const cfRes = await axios.post(`${CASHFREE_BASE_URL}/orders`, {
+    const cfRequestBody = {
       order_id: cfOrderId,
       order_amount: price,
       order_currency: "INR",
@@ -6698,7 +6707,12 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
         notify_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/cashfree-webhook`,
       },
       order_note: `Photo replacement #${count + 1}`,
-    }, {
+    };
+    console.log("[CF CREATE-ORDER] Calling Cashfree API:", CASHFREE_BASE_URL + "/orders");
+    console.log("[CF CREATE-ORDER] Request body:", JSON.stringify(cfRequestBody));
+    console.log("[CF CREATE-ORDER] AppId:", CASHFREE_APP_ID?.substring(0, 12) + "...");
+
+    const cfRes = await axios.post(`${CASHFREE_BASE_URL}/orders`, cfRequestBody, {
       headers: {
         "x-client-id": CASHFREE_APP_ID,
         "x-client-secret": CASHFREE_SECRET_KEY,
@@ -6707,13 +6721,24 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
       },
     });
 
+    console.log("[CF CREATE-ORDER] ✅ Cashfree response status:", cfRes.status);
+    console.log("[CF CREATE-ORDER] ✅ Cashfree response data:", JSON.stringify(cfRes.data));
+
     const cfOrder = cfRes.data;
+    const sessionId = cfOrder.payment_session_id;
+    console.log("[CF CREATE-ORDER] payment_session_id:", sessionId ? sessionId.substring(0, 40) + "..." : "NULL/EMPTY ❌");
+
+    if (!sessionId) {
+      console.log("[CF CREATE-ORDER] ❌ CRITICAL: Cashfree returned NO payment_session_id!");
+      return res.status(500).json({ success: false, error: "Cashfree did not return payment_session_id" });
+    }
+
     // Save pending payment in Firestore
     await admin.firestore().collection("payments").add({
       studentId: studentDoc.id,
       uid: req.firebaseUid,
       orderId: cfOrderId,
-      paymentSessionId: cfOrder.payment_session_id,
+      paymentSessionId: sessionId,
       amount: price,
       purpose: "photo_change",
       uploadNumber: count + 1,
@@ -6721,15 +6746,23 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
       gateway: "cashfree",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    return res.json({
+
+    const responseJson = {
       success: true, free: false,
       orderId: cfOrderId,
-      paymentSessionId: cfOrder.payment_session_id,
+      paymentSessionId: sessionId,
       env: CASHFREE_ENV,
       amount: price,
-    });
+    };
+    console.log("[CF CREATE-ORDER] ✅ Sending response to Flutter:", JSON.stringify(responseJson));
+    return res.json(responseJson);
   } catch (e) {
-    console.log("CREATE ORDER ERR:", e.message);
+    console.log("[CF CREATE-ORDER] ❌ EXCEPTION:", e.message);
+    if (e.response) {
+      console.log("[CF CREATE-ORDER] ❌ Axios error status:", e.response.status);
+      console.log("[CF CREATE-ORDER] ❌ Axios error data:", JSON.stringify(e.response.data));
+    }
+    console.log("[CF CREATE-ORDER] ❌ Full error:", e.stack || e);
     return res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -6801,16 +6834,18 @@ app.post("/api/payment/cashfree-webhook", async (req, res) => {
   try {
     const timestamp = req.headers["x-cashfree-timestamp"];
     const signature = req.headers["x-cashfree-signature"];
-    const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
+
+    // Use raw body for signature verification (not JSON.stringify which may reorder keys)
+    const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body);
 
     // Verify webhook signature
     const expectedSig = crypto
       .createHmac("sha256", CASHFREE_SECRET_KEY)
-      .update(timestamp + body)
+      .update(timestamp + rawBody)
       .digest("base64");
 
     if (signature !== expectedSig) {
-      console.log("[CF WEBHOOK] Invalid signature");
+      console.log("[CF WEBHOOK] Invalid signature — received:", signature, "expected:", expectedSig);
       return res.status(400).json({ error: "Invalid webhook signature" });
     }
 
