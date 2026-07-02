@@ -6677,7 +6677,10 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
     const price = count === 2 ? 10 : 15;
     console.log("[CF CREATE-ORDER] Price:", price, "uploadNumber:", count + 1);
 
-    // Duplicate protection: if a pending order already exists for this upload number, return it
+    // ── ORDER REUSE DISABLED FOR SANDBOX TESTING ──────────────────────────
+    // Previously: reuse pending orders. Disabled because switching environments
+    // invalidates old payment_session_ids (Production sessions don't work in Sandbox).
+    // TODO: Re-enable in production with environment-aware logic.
     const pendingSnap = await admin.firestore().collection("payments")
       .where("studentId", "==", studentDoc.id)
       .where("uploadNumber", "==", count + 1)
@@ -6685,19 +6688,14 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
       .limit(1)
       .get();
     if (!pendingSnap.empty) {
-      const existing = pendingSnap.docs[0].data();
-      console.log("[CF CREATE-ORDER] Reusing existing order:", existing.orderId, "sessionId:", existing.paymentSessionId?.substring(0, 30));
-      return res.json({
-        success: true, free: false,
-        orderId: existing.orderId,
-        paymentSessionId: existing.paymentSessionId,
-        env: CASHFREE_ENV,
-        amount: price,
-        reused: true,
-      });
+      // Mark old stale orders as expired so they don't block future checks
+      for (const doc of pendingSnap.docs) {
+        await doc.ref.update({ status: "expired" });
+      }
+      console.log("[CF CREATE-ORDER] Expired", pendingSnap.docs.length, "stale pending order(s). Creating fresh order.");
     }
 
-    // Create Cashfree order
+    // Always create a fresh Cashfree order
     const cfOrderId = `photo_${studentDoc.id}_${Date.now()}`;
     const cfRequestBody = {
       order_id: cfOrderId,
