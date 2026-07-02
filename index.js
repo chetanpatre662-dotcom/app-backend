@@ -7,14 +7,13 @@ process.env.TZ = "Asia/Kolkata";
 // ── Environment Validation ──────────────────────────────────────────────────
 const REQUIRED_ENV = ["ADMIN_USER", "ADMIN_PASS_HASH", "SCHOOL_ADMIN_USER", "SCHOOL_ADMIN_PASS_HASH",
   "SUPER_ADMIN_USER", "SUPER_ADMIN_PASS_HASH", "JWT_SECRET", "BUSPASS_USERNAME", "BUSPASS_PASS_HASH",
-  "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET"];
+  "CASHFREE_APP_ID", "CASHFREE_SECRET_KEY"];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) { console.error(`❌ FATAL: Missing env variable: ${key}`); process.exit(1); }
 }
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
-const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const helmet = require("helmet");
@@ -6616,12 +6615,14 @@ const upload = multer({
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// RAZORPAY PAYMENT ROUTES — Photo Change Payments
+// CASHFREE PAYMENT ROUTES — Photo Change Payments
 // ══════════════════════════════════════════════════════════════════════════════
-const razorpayInstance = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID;
+const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY;
+const CASHFREE_ENV = (process.env.CASHFREE_ENV || "PRODUCTION").toUpperCase();
+const CASHFREE_BASE_URL = CASHFREE_ENV === "PRODUCTION"
+  ? "https://api.cashfree.com/pg"
+  : "https://sandbox.cashfree.com/pg";
 
 // GET /api/payment/upload-price — Check if upload is free or requires payment
 app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
@@ -6633,7 +6634,7 @@ app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, a
     const currentYear = new Date().getFullYear();
     let count = d.photoChangeCount || 0;
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    // Pricing: 1st & 2nd = free, 3rd = ₹19, 4th+ = ₹25
+    // Pricing: 1st & 2nd = free, 3rd = ₹10, 4th+ = ₹15
     if (count < 2) {
       return res.json({ success: true, free: true, uploadNumber: count + 1, remaining: 2 - count });
     }
@@ -6644,7 +6645,7 @@ app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, a
   }
 });
 
-// POST /api/payment/create-order — Create Razorpay order for paid upload
+// POST /api/payment/create-order — Create Cashfree order for paid upload
 app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
   try {
     const snap = await admin.firestore().collection("students")
@@ -6660,7 +6661,6 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
       return res.json({ success: true, free: true, message: "Free upload available" });
     }
     const price = count === 2 ? 10 : 15;
-    const amountPaise = price * 100;
 
     // Duplicate protection: if a pending order already exists for this upload number, return it
     const pendingSnap = await admin.firestore().collection("payments")
@@ -6674,36 +6674,59 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
       return res.json({
         success: true, free: false,
         orderId: existing.orderId,
-        keyId: process.env.RAZORPAY_KEY_ID,
-        amount: amountPaise,
-        currency: "INR",
+        paymentSessionId: existing.paymentSessionId,
+        env: CASHFREE_ENV,
+        amount: price,
         reused: true,
       });
     }
 
-    const order = await razorpayInstance.orders.create({
-      amount: amountPaise,
-      currency: "INR",
-      receipt: `photo_${studentDoc.id}_${Date.now()}`,
-      notes: { studentId: studentDoc.id, uploadNumber: count + 1, purpose: "photo_change" },
+    // Create Cashfree order
+    const cfOrderId = `photo_${studentDoc.id}_${Date.now()}`;
+    const cfRes = await axios.post(`${CASHFREE_BASE_URL}/orders`, {
+      order_id: cfOrderId,
+      order_amount: price,
+      order_currency: "INR",
+      customer_details: {
+        customer_id: studentDoc.id,
+        customer_email: d.email || "student@scep.edu",
+        customer_phone: d.mobile || "9999999999",
+        customer_name: d.name || "Student",
+      },
+      order_meta: {
+        return_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/return?order_id=${cfOrderId}`,
+        notify_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/cashfree-webhook`,
+      },
+      order_note: `Photo replacement #${count + 1}`,
+    }, {
+      headers: {
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "x-api-version": "2023-08-01",
+        "Content-Type": "application/json",
+      },
     });
+
+    const cfOrder = cfRes.data;
     // Save pending payment in Firestore
     await admin.firestore().collection("payments").add({
       studentId: studentDoc.id,
       uid: req.firebaseUid,
-      orderId: order.id,
+      orderId: cfOrderId,
+      paymentSessionId: cfOrder.payment_session_id,
       amount: price,
       purpose: "photo_change",
       uploadNumber: count + 1,
       status: "created",
+      gateway: "cashfree",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     return res.json({
       success: true, free: false,
-      orderId: order.id,
-      keyId: process.env.RAZORPAY_KEY_ID,
-      amount: amountPaise,
-      currency: "INR",
+      orderId: cfOrderId,
+      paymentSessionId: cfOrder.payment_session_id,
+      env: CASHFREE_ENV,
+      amount: price,
     });
   } catch (e) {
     console.log("CREATE ORDER ERR:", e.message);
@@ -6711,74 +6734,88 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
   }
 });
 
-// POST /api/payment/verify — Verify Razorpay payment signature & unlock upload
+// POST /api/payment/verify — Verify Cashfree payment status & unlock upload
 app.post("/api/payment/verify", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
   try {
-    const { orderId, paymentId, signature } = req.body;
-    if (!orderId || !paymentId || !signature) {
-      return res.status(400).json({ success: false, verified: false, error: "Missing fields" });
+    const { orderId } = req.body;
+    if (!orderId) {
+      return res.status(400).json({ success: false, verified: false, error: "Missing orderId" });
     }
-    // HMAC SHA256 signature verification
-    const expectedSig = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(orderId + "|" + paymentId)
-      .digest("hex");
-    if (expectedSig !== signature) {
-      return res.status(400).json({ success: false, verified: false, error: "Invalid signature" });
+
+    // Verify payment status with Cashfree API
+    const cfRes = await axios.get(`${CASHFREE_BASE_URL}/orders/${orderId}`, {
+      headers: {
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "x-api-version": "2023-08-01",
+      },
+    });
+
+    const cfOrder = cfRes.data;
+    if (cfOrder.order_status !== "PAID") {
+      return res.json({ success: false, verified: false, error: `Payment status: ${cfOrder.order_status}` });
     }
-    // Update payment record
+
+    // Find payment record
     const paySnap = await admin.firestore().collection("payments")
       .where("orderId", "==", orderId).limit(1).get();
-    if (paySnap.empty) {
-      return res.status(404).json({ success: false, verified: false, error: "Payment not found" });
-    }
+    if (paySnap.empty) return res.status(404).json({ success: false, error: "Payment record not found" });
     const payDoc = paySnap.docs[0];
+    if (payDoc.data().status === "verified") {
+      return res.json({ success: true, verified: true, message: "Already verified" });
+    }
+
+    // Update payment record
     await payDoc.ref.update({
       status: "verified",
-      paymentId,
-      signature,
+      cfPaymentId: cfOrder.cf_order_id || "",
       verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    // Grant paid upload: set paidUploadAvailable = true on student doc
+
+    // Grant paid upload
     const studentId = payDoc.data().studentId;
     await admin.firestore().collection("students").doc(studentId).update({
       paidUploadAvailable: true,
-      lastPaymentId: paymentId,
+      lastPaymentId: orderId,
       lastPaymentAmount: payDoc.data().amount,
-      lastPaymentDate: admin.firestore.FieldValue.serverTimestamp(),
     });
-    // Notify student about successful payment
+
+    // Notify student
     await createUserNotification(studentId, "payment", "Payment Successful",
       `₹${payDoc.data().amount} payment verified. You can now upload a new photo.`,
-      { paymentId, amount: payDoc.data().amount });
+      { orderId, amount: payDoc.data().amount });
+
     return res.json({ success: true, verified: true });
   } catch (e) {
-    console.log("VERIFY ERR:", e.message);
+    console.log("VERIFY PAYMENT ERR:", e.message);
     return res.status(500).json({ success: false, verified: false, error: e.message });
   }
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════════
-   PAYMENT — Webhook, Refund, Invoice, History, Retry, Duplicate Protection
+   PAYMENT — Cashfree Webhook, Refund, History, Retry, Duplicate Protection
 ═══════════════════════════════════════════════════════════════════════════════ */
 
-// POST /api/payment/webhook — Razorpay Webhook (server-to-server, signature verified)
-app.post("/api/payment/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+// POST /api/payment/cashfree-webhook — Cashfree Webhook (server-to-server, signature verified)
+app.post("/api/payment/cashfree-webhook", async (req, res) => {
   try {
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-    if (!webhookSecret) return res.status(500).json({ error: "Webhook not configured" });
+    const timestamp = req.headers["x-cashfree-timestamp"];
+    const signature = req.headers["x-cashfree-signature"];
+    const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
 
-    const receivedSig = req.headers["x-razorpay-signature"];
-    const body = req.rawBody || req.body;
-    const expectedSig = crypto.createHmac("sha256", webhookSecret).update(body).digest("hex");
+    // Verify webhook signature
+    const expectedSig = crypto
+      .createHmac("sha256", CASHFREE_SECRET_KEY)
+      .update(timestamp + body)
+      .digest("base64");
 
-    if (receivedSig !== expectedSig) {
-      console.log("[WEBHOOK] Invalid signature");
+    if (signature !== expectedSig) {
+      console.log("[CF WEBHOOK] Invalid signature");
       return res.status(400).json({ error: "Invalid webhook signature" });
     }
 
-    const event = JSON.parse(body);
-    const eventType = event.event;
+    const event = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const eventType = event.type;
     const payload = event.payload?.payment?.entity;
 
     if (!payload) return res.json({ status: "ignored" });
@@ -6786,7 +6823,7 @@ app.post("/api/payment/webhook", express.raw({ type: "application/json" }), asyn
     console.log("[WEBHOOK] Event:", eventType, "Payment:", payload.id);
 
     if (eventType === "payment.captured") {
-      // Find payment record by Razorpay order_id
+      // Find payment record by order_id
       const paySnap = await admin.firestore().collection("payments")
         .where("orderId", "==", payload.order_id).limit(1).get();
       if (!paySnap.empty) {
@@ -6840,15 +6877,30 @@ app.post("/admin/payment/refund", adminAuth, async (req, res) => {
     const payDoc = paySnap.docs[0];
     if (payDoc.data().status === "refunded") return res.status(400).json({ success: false, error: "Already refunded" });
 
-    // Initiate Razorpay refund
-    const refundAmount = amount ? amount * 100 : undefined; // partial or full
-    const refund = await razorpayInstance.payments.refund(paymentId, { amount: refundAmount });
+    // Initiate Cashfree refund
+    const cfRefundRes = await axios.post(
+      `${CASHFREE_BASE_URL}/orders/${payDoc.data().orderId}/refunds`,
+      {
+        refund_amount: amount || payDoc.data().amount,
+        refund_id: `refund_${payDoc.id}_${Date.now()}`,
+        refund_note: "Admin initiated refund for photo change fee",
+      },
+      {
+        headers: {
+          "x-client-id": CASHFREE_APP_ID,
+          "x-client-secret": CASHFREE_SECRET_KEY,
+          "x-api-version": "2023-08-01",
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    const refund = cfRefundRes.data;
 
     // Update payment record
     await payDoc.ref.update({
       status: "refund_initiated",
-      refundId: refund.id,
-      refundAmount: refund.amount / 100,
+      refundId: refund.refund_id,
+      refundAmount: refund.refund_amount,
       refundInitiatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
@@ -6858,11 +6910,11 @@ app.post("/admin/payment/refund", adminAuth, async (req, res) => {
 
     // Notify student
     await createUserNotification(studentId, "payment", "Refund Initiated",
-      `₹${refund.amount / 100} refund has been initiated. It will reflect in 5-7 business days.`,
-      { refundId: refund.id });
+      `₹${refund.refund_amount} refund has been initiated. It will reflect in 5-7 business days.`,
+      { refundId: refund.refund_id });
 
-    await logAuditEvent("payment_refund", req.adminRole, req.adminInstitution, { paymentId, refundId: refund.id, amount: refund.amount / 100 });
-    return res.json({ success: true, refundId: refund.id, amount: refund.amount / 100 });
+    await logAuditEvent("payment_refund", req.adminRole, req.adminInstitution, { paymentId, refundId: refund.refund_id, amount: refund.refund_amount });
+    return res.json({ success: true, refundId: refund.refund_id, amount: refund.refund_amount });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
   }
@@ -6911,7 +6963,7 @@ app.get("/api/payment/invoice/:paymentDocId", authenticateFirebaseUser, async (r
         paymentId: data.paymentId || null,
         orderId: data.orderId,
         status: data.status,
-        gateway: "Razorpay",
+        gateway: data.gateway || "Cashfree",
       }
     });
   } catch (e) {
@@ -6940,34 +6992,56 @@ app.post("/api/payment/retry", paymentLimiter, authenticateFirebaseUser, async (
       .get();
     if (!dupeSnap.empty) return res.status(400).json({ success: false, error: "A verified payment already exists for this upload" });
 
-    // Create new Razorpay order
-    const amountPaise = (failedData.amount || 15) * 100;
-    const order = await razorpayInstance.orders.create({
-      amount: amountPaise,
-      currency: "INR",
-      receipt: `retry_${failedData.studentId}_${Date.now()}`,
-      notes: { studentId: failedData.studentId, uploadNumber: failedData.uploadNumber, retryOf: failedPaymentId },
+    // Create new Cashfree order for retry
+    const cfOrderId = `retry_${failedData.studentId}_${Date.now()}`;
+    const studentSnap = await admin.firestore().collection("students").doc(failedData.studentId).get();
+    const sd = studentSnap.exists ? studentSnap.data() : {};
+    const cfRes = await axios.post(`${CASHFREE_BASE_URL}/orders`, {
+      order_id: cfOrderId,
+      order_amount: failedData.amount || 15,
+      order_currency: "INR",
+      customer_details: {
+        customer_id: failedData.studentId,
+        customer_email: sd.email || "student@scep.edu",
+        customer_phone: sd.mobile || "9999999999",
+        customer_name: sd.name || "Student",
+      },
+      order_meta: {
+        return_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/return?order_id=${cfOrderId}`,
+        notify_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/cashfree-webhook`,
+      },
+      order_note: `Photo replacement #${failedData.uploadNumber} (retry)`,
+    }, {
+      headers: {
+        "x-client-id": CASHFREE_APP_ID,
+        "x-client-secret": CASHFREE_SECRET_KEY,
+        "x-api-version": "2023-08-01",
+        "Content-Type": "application/json",
+      },
     });
+    const cfOrder = cfRes.data;
 
     // Save new payment record
     await admin.firestore().collection("payments").add({
       studentId: failedData.studentId,
       uid: failedData.uid,
-      orderId: order.id,
+      orderId: cfOrderId,
+      paymentSessionId: cfOrder.payment_session_id,
       amount: failedData.amount,
       purpose: failedData.purpose || "photo_change",
       uploadNumber: failedData.uploadNumber,
       status: "created",
+      gateway: "cashfree",
       retryOf: failedPaymentId,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     return res.json({
       success: true,
-      orderId: order.id,
-      keyId: process.env.RAZORPAY_KEY_ID,
-      amount: amountPaise,
-      currency: "INR",
+      orderId: cfOrderId,
+      paymentSessionId: cfOrder.payment_session_id,
+      env: CASHFREE_ENV,
+      amount: failedData.amount,
     });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
@@ -7083,7 +7157,7 @@ function classifyError(err) {
   if (msg.includes("firebase") || msg.includes("firestore")) return "FIREBASE";
   if (msg.includes("redis") || msg.includes("econnreset")) return "REDIS";
   if (msg.includes("jwt") || msg.includes("token")) return "AUTH";
-  if (msg.includes("razorpay")) return "PAYMENT";
+  if (msg.includes("cashfree")) return "PAYMENT";
   if (msg.includes("enomem") || msg.includes("heap")) return "MEMORY";
   return "APPLICATION";
 }
