@@ -6619,7 +6619,7 @@ const upload = multer({
 // ══════════════════════════════════════════════════════════════════════════════
 const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID;
 const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY;
-const CASHFREE_ENV = (process.env.CASHFREE_ENV || "SANDBOX").toUpperCase();
+const CASHFREE_ENV = (process.env.CASHFREE_ENV || "PRODUCTION").toUpperCase();
 const CASHFREE_BASE_URL = CASHFREE_ENV === "PRODUCTION"
   ? "https://api.cashfree.com/pg"
   : "https://sandbox.cashfree.com/pg";
@@ -6680,10 +6680,9 @@ app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, 
     const price = count === 2 ? 10 : 15;
     console.log("[CF CREATE-ORDER] Price:", price, "uploadNumber:", count + 1);
 
-    // ── ORDER REUSE DISABLED FOR SANDBOX TESTING ──────────────────────────
-    // Previously: reuse pending orders. Disabled because switching environments
-    // invalidates old payment_session_ids (Production sessions don't work in Sandbox).
-    // TODO: Re-enable in production with environment-aware logic.
+    // ── STALE ORDER CLEANUP ──────────────────────────────────────────────────
+    // Always create a fresh Cashfree order. Expire any previously pending orders
+    // for the same uploadNumber to avoid confusion with stale payment sessions.
     const pendingSnap = await admin.firestore().collection("payments")
       .where("studentId", "==", studentDoc.id)
       .where("uploadNumber", "==", count + 1)
@@ -6847,6 +6846,17 @@ app.post("/api/payment/cashfree-webhook", async (req, res) => {
     const timestamp = req.headers["x-cashfree-timestamp"];
     const signature = req.headers["x-cashfree-signature"];
 
+    if (!timestamp || !signature) {
+      return res.status(400).json({ error: "Missing webhook headers" });
+    }
+
+    // Reject webhooks older than 5 minutes (replay protection)
+    const webhookAge = Math.abs(Date.now() - parseInt(timestamp) * 1000);
+    if (webhookAge > 5 * 60 * 1000) {
+      console.log("[CF WEBHOOK] ❌ Stale webhook rejected. Age:", Math.round(webhookAge / 1000), "seconds");
+      return res.status(400).json({ error: "Webhook too old" });
+    }
+
     // Use raw body for signature verification (not JSON.stringify which may reorder keys)
     const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body);
 
@@ -6857,7 +6867,7 @@ app.post("/api/payment/cashfree-webhook", async (req, res) => {
       .digest("base64");
 
     if (signature !== expectedSig) {
-      console.log("[CF WEBHOOK] Invalid signature — received:", signature, "expected:", expectedSig);
+      console.log("[CF WEBHOOK] ❌ Invalid webhook signature. Rejecting.");
       return res.status(400).json({ error: "Invalid webhook signature" });
     }
 
