@@ -7104,7 +7104,16 @@ app.post("/api/payment/retry", paymentLimiter, authenticateFirebaseUser, async (
 
 app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFirebaseUser, async (req, res) => {
   try {
+    console.log("[BACKEND UPLOAD] ═══ REQUEST RECEIVED ═══");
+    console.log("[BACKEND 1] uid:", req.firebaseUid);
+    console.log("[BACKEND 2] req.file exists:", !!req.file);
     if (!req.file) return res.status(400).json({ error: "No photo file provided" });
+    console.log("[BACKEND 3] originalname:", req.file.originalname);
+    console.log("[BACKEND 3] mimetype:", req.file.mimetype);
+    console.log("[BACKEND 3] size:", req.file.size);
+    console.log("[BACKEND 3] buffer.length:", req.file.buffer?.length);
+    console.log("[BACKEND 3] encoding:", req.file.encoding);
+    console.log("[BACKEND 3] fieldname:", req.file.fieldname);
     // Find student by VERIFIED UID (from middleware — cannot be forged)
     const snap = await admin.firestore().collection("students")
       .where("uid", "==", req.firebaseUid).limit(1).get();
@@ -7118,7 +7127,9 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
     // allowedPhotoUploads defaults to 2 (free uploads), incremented by each payment
     const allowed = d.allowedPhotoUploads ?? 2;
+    console.log("[BACKEND 4] studentId:", studentId, "count:", count, "allowed:", allowed);
     if (count >= allowed) {
+      console.log("[BACKEND 4] ❌ LIMIT REACHED. count >= allowed");
       return res.status(429).json({
         error: "Photo change limit reached. Payment required.",
         photoChangeCount: count,
@@ -7129,18 +7140,22 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     const bucket = admin.storage().bucket("scep-bus.firebasestorage.app");
     const filePath = `bus-pass-photos/${req.firebaseUid}/profile.jpg`;
     const file = bucket.file(filePath);
-    // Upload diagnostics
-    console.log("[PHOTO UPLOAD]", { bucket: bucket.name, path: filePath, mime: req.file.mimetype, size: req.file.size });
+    console.log("[BACKEND 5] bucket:", bucket.name, "path:", filePath);
     // Compress image with Sharp before saving (resize, quality, strip metadata)
+    console.log("[BACKEND 6] Starting sharp compression... buffer.length:", req.file.buffer.length);
     const compressed = await sharp(req.file.buffer)
       .rotate() // auto-rotate based on EXIF
       .resize({ width: 1080, withoutEnlargement: true }) // max 1080px wide
       .jpeg({ quality: 80 }) // convert to JPEG, quality 80
       .toBuffer();
-    console.log(`[PHOTO] Compressed: ${req.file.buffer.length} → ${compressed.length} bytes`);
+    console.log(`[BACKEND 7] ✅ Sharp success. ${req.file.buffer.length} → ${compressed.length} bytes`);
+    console.log("[BACKEND 8] Uploading to Firebase Storage...");
     await file.save(compressed, { metadata: { contentType: "image/jpeg" }, public: false });
+    console.log("[BACKEND 8] ✅ Storage upload complete");
     // Generate signed URL (7 days — refreshed via /photo-url endpoint)
+    console.log("[BACKEND 9] Generating signed URL...");
     const [signedUrl] = await file.getSignedUrl({ action: "read", expires: Date.now() + 7*24*60*60*1000 });
+    console.log("[BACKEND 9] ✅ Signed URL generated");
     // Upload succeeded — NOW increment photoChangeCount (credit NOT consumed, allowedPhotoUploads stays)
     count++;
     const updateData = {
@@ -7150,8 +7165,10 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
       photoChangeResetYear: currentYear,
       photoUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
+    console.log("[BACKEND 10] Updating Firestore... photoChangeCount:", count);
     await admin.firestore().collection("students").doc(studentId).update(updateData);
-    console.log(`[PHOTO UPLOAD] ✅ Success. studentId=${studentId} count=${count}/${allowed}`);
+    console.log("[BACKEND 10] ✅ Firestore updated");
+    console.log(`[BACKEND 11] ✅ SUCCESS. studentId=${studentId} count=${count}/${allowed}`);
     return res.json({
       success: true,
       photoUrl: signedUrl,
@@ -7159,7 +7176,11 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
       allowedPhotoUploads: allowed,
     });
   } catch (e) {
-    console.log("PHOTO UPLOAD ERR:", e.message);
+    console.log("[BACKEND] ❌ EXCEPTION:", e.message);
+    console.log("[BACKEND] ❌ STACK:", e.stack);
+    if (req.file) {
+      console.log("[BACKEND] ❌ File context: name=", req.file.originalname, "mime=", req.file.mimetype, "size=", req.file.size, "bufferLen=", req.file.buffer?.length);
+    }
     return res.status(500).json({ error: e.message });
   }
 });
