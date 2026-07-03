@@ -6,8 +6,7 @@ process.env.TZ = "Asia/Kolkata";
 
 // ── Environment Validation ──────────────────────────────────────────────────
 const REQUIRED_ENV = ["ADMIN_USER", "ADMIN_PASS_HASH", "SCHOOL_ADMIN_USER", "SCHOOL_ADMIN_PASS_HASH",
-  "SUPER_ADMIN_USER", "SUPER_ADMIN_PASS_HASH", "JWT_SECRET", "BUSPASS_USERNAME", "BUSPASS_PASS_HASH",
-  "CASHFREE_APP_ID", "CASHFREE_SECRET_KEY"];
+  "SUPER_ADMIN_USER", "SUPER_ADMIN_PASS_HASH", "JWT_SECRET", "BUSPASS_USERNAME", "BUSPASS_PASS_HASH"];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) { console.error(`❌ FATAL: Missing env variable: ${key}`); process.exit(1); }
 }
@@ -287,13 +286,6 @@ const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: "Too many login attempts. Try again after 15 minutes." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-const paymentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { error: "Too many payment requests. Slow down." },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -5597,16 +5589,6 @@ app.post("/admin/login", loginLimiter, async (req, res) => {
       return res.json({ success: true, token, institution: "buspass", role: "bus_pass_admin" });
     }
 
-    // Payment Admin
-    if (username === process.env.PAYMENT_USERNAME && await bcrypt.compare(password, process.env.PAYMENT_PASS_HASH)) {
-      const token = jwt.sign(
-        { admin: true, role: "payment_admin", institution: "buspass" },
-        process.env.JWT_SECRET,
-        { expiresIn: "4h" }
-      );
-      return res.json({ success: true, token, institution: "buspass", role: "payment_admin" });
-    }
-
     return res.status(401).json({ success: false, error: "Invalid credentials" });
   } catch (e) {
     console.log("LOGIN ERROR:", e.message);
@@ -6587,7 +6569,7 @@ app.get("/api/bus-pass/student/:studentId", authenticateFirebaseUser, async (req
       course: d.course||"", year: d.year||d.academicYear||"", busId: d.busId||"",
       city: d.city||"", busPassId: d.busPassId||null, verifiedForBusPass: d.verifiedForBusPass||false,
       busPassExpiry: d.busPassExpiry||null, session: d.session||"", status,
-      passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, allowedPhotoUploads: d.allowedPhotoUploads ?? 2,
+      passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, photoChangeLimit: 3,
     }});
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -6614,504 +6596,6 @@ const upload = multer({
   },
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CASHFREE PAYMENT ROUTES — Photo Change Payments
-// ══════════════════════════════════════════════════════════════════════════════
-const CASHFREE_APP_ID = process.env.CASHFREE_APP_ID;
-const CASHFREE_SECRET_KEY = process.env.CASHFREE_SECRET_KEY;
-const CASHFREE_ENV = (process.env.CASHFREE_ENV || "PRODUCTION").toUpperCase();
-const CASHFREE_BASE_URL = CASHFREE_ENV === "PRODUCTION"
-  ? "https://api.cashfree.com/pg"
-  : "https://sandbox.cashfree.com/pg";
-
-console.log("==========================");
-console.log("  Cashfree Environment");
-console.log(`  Environment : ${CASHFREE_ENV}`);
-console.log(`  Base URL    : ${CASHFREE_BASE_URL}`);
-console.log(`  App ID      : ${CASHFREE_APP_ID ? CASHFREE_APP_ID.substring(0, 16) + "..." : "NOT SET"}`);
-console.log("==========================");
-
-// GET /api/payment/upload-price — Check if upload is free or requires payment
-app.get("/api/payment/upload-price", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
-  try {
-    const snap = await admin.firestore().collection("students")
-      .where("uid", "==", req.firebaseUid).limit(1).get();
-    if (snap.empty) return res.status(404).json({ success: false, error: "Student not found" });
-    const d = snap.docs[0].data();
-    const currentYear = new Date().getFullYear();
-    let count = d.photoChangeCount || 0;
-    if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    const allowed = d.allowedPhotoUploads ?? 2;
-    // If user still has uploads available (free or paid), no payment needed
-    if (count < allowed) {
-      return res.json({ success: true, free: true, uploadNumber: count + 1, photoChangeCount: count, allowedPhotoUploads: allowed });
-    }
-    // Pricing: 3rd upload = ₹10, 4th+ = ₹15
-    const price = count === 2 ? 10 : 15;
-    return res.json({ success: true, free: false, price, uploadNumber: count + 1, photoChangeCount: count, allowedPhotoUploads: allowed });
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// POST /api/payment/create-order — Create Cashfree order for paid upload
-app.post("/api/payment/create-order", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
-  console.log("[CF CREATE-ORDER] ▶ Request received. uid:", req.firebaseUid);
-  try {
-    const snap = await admin.firestore().collection("students")
-      .where("uid", "==", req.firebaseUid).limit(1).get();
-    if (snap.empty) {
-      console.log("[CF CREATE-ORDER] ❌ Student not found for uid:", req.firebaseUid);
-      return res.status(404).json({ success: false, error: "Student not found" });
-    }
-    const studentDoc = snap.docs[0];
-    const d = studentDoc.data();
-    const currentYear = new Date().getFullYear();
-    let count = d.photoChangeCount || 0;
-    if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    const allowed = d.allowedPhotoUploads ?? 2;
-    console.log("[CF CREATE-ORDER] Student:", studentDoc.id, "photoChangeCount:", count, "allowedPhotoUploads:", allowed);
-
-    // If uploads still available (free or previously paid), no new payment needed
-    if (count < allowed) {
-      console.log("[CF CREATE-ORDER] Upload available without payment. count:", count, "allowed:", allowed);
-      return res.json({ success: true, free: true, message: "Upload available", photoChangeCount: count, allowedPhotoUploads: allowed });
-    }
-    const price = count === 2 ? 10 : 15;
-    console.log("[CF CREATE-ORDER] Price:", price, "uploadNumber:", count + 1);
-
-    // ── STALE ORDER CLEANUP ──────────────────────────────────────────────────
-    // Always create a fresh Cashfree order. Expire any previously pending orders
-    // for the same uploadNumber to avoid confusion with stale payment sessions.
-    const pendingSnap = await admin.firestore().collection("payments")
-      .where("studentId", "==", studentDoc.id)
-      .where("uploadNumber", "==", count + 1)
-      .where("status", "==", "created")
-      .limit(1)
-      .get();
-    if (!pendingSnap.empty) {
-      // Mark old stale orders as expired so they don't block future checks
-      for (const doc of pendingSnap.docs) {
-        await doc.ref.update({ status: "expired" });
-      }
-      console.log("[CF CREATE-ORDER] Expired", pendingSnap.docs.length, "stale pending order(s). Creating fresh order.");
-    }
-
-    // Always create a fresh Cashfree order
-    const cfOrderId = `photo_${studentDoc.id}_${Date.now()}`;
-    const cfRequestBody = {
-      order_id: cfOrderId,
-      order_amount: price,
-      order_currency: "INR",
-      customer_details: {
-        customer_id: studentDoc.id,
-        customer_email: d.email || "student@scep.edu",
-        customer_phone: d.mobile || "9999999999",
-        customer_name: d.name || "Student",
-      },
-      order_meta: {
-        return_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/return?order_id=${cfOrderId}`,
-        notify_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/cashfree-webhook`,
-      },
-      order_note: `Photo replacement #${count + 1}`,
-    };
-    console.log("[CF CREATE-ORDER] Calling Cashfree API:", CASHFREE_BASE_URL + "/orders");
-    console.log("[CF CREATE-ORDER] Request body:", JSON.stringify(cfRequestBody));
-    console.log("[CF CREATE-ORDER] AppId:", CASHFREE_APP_ID?.substring(0, 12) + "...");
-
-    const cfRes = await axios.post(`${CASHFREE_BASE_URL}/orders`, cfRequestBody, {
-      headers: {
-        "x-client-id": CASHFREE_APP_ID,
-        "x-client-secret": CASHFREE_SECRET_KEY,
-        "x-api-version": "2023-08-01",
-        "Content-Type": "application/json",
-      },
-    });
-
-    console.log("[CF CREATE-ORDER] ✅ Cashfree response status:", cfRes.status);
-    console.log("[CF CREATE-ORDER] ✅ Cashfree response data:", JSON.stringify(cfRes.data));
-
-    const cfOrder = cfRes.data;
-    const sessionId = cfOrder.payment_session_id;
-    console.log("[CF CREATE-ORDER] payment_session_id:", sessionId ? sessionId.substring(0, 40) + "..." : "NULL/EMPTY ❌");
-
-    if (!sessionId) {
-      console.log("[CF CREATE-ORDER] ❌ CRITICAL: Cashfree returned NO payment_session_id!");
-      return res.status(500).json({ success: false, error: "Cashfree did not return payment_session_id" });
-    }
-
-    // Save pending payment in Firestore
-    await admin.firestore().collection("payments").add({
-      studentId: studentDoc.id,
-      uid: req.firebaseUid,
-      orderId: cfOrderId,
-      paymentSessionId: sessionId,
-      amount: price,
-      purpose: "photo_change",
-      uploadNumber: count + 1,
-      status: "created",
-      gateway: "cashfree",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    const responseJson = {
-      success: true, free: false,
-      orderId: cfOrderId,
-      paymentSessionId: sessionId,
-      env: CASHFREE_ENV,
-      amount: price,
-    };
-    console.log("[CF CREATE-ORDER] ✅ Sending response to Flutter:", JSON.stringify(responseJson));
-    return res.json(responseJson);
-  } catch (e) {
-    console.log("[CF CREATE-ORDER] ❌ EXCEPTION:", e.message);
-    if (e.response) {
-      console.log("[CF CREATE-ORDER] ❌ Axios error status:", e.response.status);
-      console.log("[CF CREATE-ORDER] ❌ Axios error data:", JSON.stringify(e.response.data));
-    }
-    console.log("[CF CREATE-ORDER] ❌ Full error:", e.stack || e);
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// POST /api/payment/verify — Verify Cashfree payment status & unlock upload
-app.post("/api/payment/verify", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
-  try {
-    const { orderId } = req.body;
-    if (!orderId) {
-      return res.status(400).json({ success: false, verified: false, error: "Missing orderId" });
-    }
-
-    // Verify payment status with Cashfree API
-    const cfRes = await axios.get(`${CASHFREE_BASE_URL}/orders/${orderId}`, {
-      headers: {
-        "x-client-id": CASHFREE_APP_ID,
-        "x-client-secret": CASHFREE_SECRET_KEY,
-        "x-api-version": "2023-08-01",
-      },
-    });
-
-    const cfOrder = cfRes.data;
-    if (cfOrder.order_status !== "PAID") {
-      return res.json({ success: false, verified: false, error: `Payment status: ${cfOrder.order_status}` });
-    }
-
-    // Find payment record
-    const paySnap = await admin.firestore().collection("payments")
-      .where("orderId", "==", orderId).limit(1).get();
-    if (paySnap.empty) return res.status(404).json({ success: false, error: "Payment record not found" });
-    const payDoc = paySnap.docs[0];
-    if (payDoc.data().status === "verified") {
-      return res.json({ success: true, verified: true, message: "Already verified" });
-    }
-
-    // Use transaction to prevent double-increment race with webhook
-    const studentId = payDoc.data().studentId;
-    const payAmount = payDoc.data().amount;
-    await admin.firestore().runTransaction(async (tx) => {
-      const freshPay = await tx.get(payDoc.ref);
-      if (freshPay.data().creditGranted) return; // Already granted by webhook — skip increment
-      tx.update(payDoc.ref, {
-        status: "verified",
-        creditGranted: true,
-        cfPaymentId: cfOrder.cf_order_id || "",
-        verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      tx.update(admin.firestore().collection("students").doc(studentId), {
-        allowedPhotoUploads: admin.firestore.FieldValue.increment(1),
-        lastPaymentId: orderId,
-        lastPaymentAmount: payAmount,
-      });
-    });
-
-    // Notify student
-    await createUserNotification(studentId, "payment", "Payment Successful",
-      `₹${payDoc.data().amount} payment verified. You can now upload a new photo.`,
-      { orderId, amount: payDoc.data().amount });
-
-    return res.json({ success: true, verified: true });
-  } catch (e) {
-    console.log("VERIFY PAYMENT ERR:", e.message);
-    return res.status(500).json({ success: false, verified: false, error: e.message });
-  }
-});
-
-/* ═══════════════════════════════════════════════════════════════════════════════
-   PAYMENT — Cashfree Webhook, Refund, History, Retry, Duplicate Protection
-═══════════════════════════════════════════════════════════════════════════════ */
-
-// POST /api/payment/cashfree-webhook — Cashfree Webhook (server-to-server, signature verified)
-app.post("/api/payment/cashfree-webhook", async (req, res) => {
-  try {
-    const timestamp = req.headers["x-cashfree-timestamp"];
-    const signature = req.headers["x-cashfree-signature"];
-
-    if (!timestamp || !signature) {
-      return res.status(400).json({ error: "Missing webhook headers" });
-    }
-
-    // Reject webhooks older than 5 minutes (replay protection)
-    const webhookAge = Math.abs(Date.now() - parseInt(timestamp) * 1000);
-    if (webhookAge > 5 * 60 * 1000) {
-      console.log("[CF WEBHOOK] ❌ Stale webhook rejected. Age:", Math.round(webhookAge / 1000), "seconds");
-      return res.status(400).json({ error: "Webhook too old" });
-    }
-
-    // Use raw body for signature verification (not JSON.stringify which may reorder keys)
-    const rawBody = req.rawBody ? req.rawBody.toString("utf8") : JSON.stringify(req.body);
-
-    // Verify webhook signature
-    const expectedSig = crypto
-      .createHmac("sha256", CASHFREE_SECRET_KEY)
-      .update(timestamp + rawBody)
-      .digest("base64");
-
-    if (signature !== expectedSig) {
-      console.log("[CF WEBHOOK] ❌ Invalid webhook signature. Rejecting.");
-      return res.status(400).json({ error: "Invalid webhook signature" });
-    }
-
-    const event = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-    const eventType = event.type;
-    const payload = event.payload?.payment?.entity;
-
-    if (!payload) return res.json({ status: "ignored" });
-
-    console.log("[WEBHOOK] Event:", eventType, "Payment:", payload.id);
-
-    if (eventType === "payment.captured") {
-      // Find payment record by order_id
-      const paySnap = await admin.firestore().collection("payments")
-        .where("orderId", "==", payload.order_id).limit(1).get();
-      if (!paySnap.empty) {
-        const payDoc = paySnap.docs[0];
-        // Use transaction to prevent double-increment race with verify endpoint
-        await admin.firestore().runTransaction(async (tx) => {
-          const freshPay = await tx.get(payDoc.ref);
-          if (freshPay.data().creditGranted) return; // Already granted by verify — skip
-          tx.update(payDoc.ref, {
-            status: "verified",
-            creditGranted: true,
-            paymentId: payload.id,
-            webhookVerified: true,
-            verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          const studentId = freshPay.data().studentId;
-          tx.update(admin.firestore().collection("students").doc(studentId), {
-            allowedPhotoUploads: admin.firestore.FieldValue.increment(1),
-          });
-          console.log("[WEBHOOK] Auto-verified payment for:", studentId);
-        });
-      }
-    } else if (eventType === "payment.failed") {
-      const paySnap = await admin.firestore().collection("payments")
-        .where("orderId", "==", payload.order_id).limit(1).get();
-      if (!paySnap.empty) {
-        await paySnap.docs[0].ref.update({ status: "failed", failReason: payload.error_description || "Unknown", failedAt: admin.firestore.FieldValue.serverTimestamp() });
-      }
-    } else if (eventType === "refund.created") {
-      const refundEntity = event.payload?.refund?.entity;
-      if (refundEntity) {
-        await admin.firestore().collection("payments")
-          .where("paymentId", "==", refundEntity.payment_id).limit(1).get()
-          .then(snap => { if (!snap.empty) snap.docs[0].ref.update({ status: "refunded", refundId: refundEntity.id, refundedAt: admin.firestore.FieldValue.serverTimestamp() }); });
-      }
-    }
-
-    return res.json({ status: "ok" });
-  } catch (e) {
-    console.log("[WEBHOOK] Error:", e.message);
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /admin/payment/refund — Initiate refund (admin only)
-app.post("/admin/payment/refund", adminAuth, async (req, res) => {
-  try {
-    const { paymentId, amount } = req.body;
-    if (!paymentId) return res.status(400).json({ success: false, error: "paymentId required" });
-
-    // Find payment record
-    const paySnap = await admin.firestore().collection("payments")
-      .where("paymentId", "==", paymentId).limit(1).get();
-    if (paySnap.empty) return res.status(404).json({ success: false, error: "Payment not found" });
-
-    const payDoc = paySnap.docs[0];
-    if (payDoc.data().status === "refunded") return res.status(400).json({ success: false, error: "Already refunded" });
-
-    // Initiate Cashfree refund
-    const cfRefundRes = await axios.post(
-      `${CASHFREE_BASE_URL}/orders/${payDoc.data().orderId}/refunds`,
-      {
-        refund_amount: amount || payDoc.data().amount,
-        refund_id: `refund_${payDoc.id}_${Date.now()}`,
-        refund_note: "Admin initiated refund for photo change fee",
-      },
-      {
-        headers: {
-          "x-client-id": CASHFREE_APP_ID,
-          "x-client-secret": CASHFREE_SECRET_KEY,
-          "x-api-version": "2023-08-01",
-          "Content-Type": "application/json",
-        },
-      }
-    );
-    const refund = cfRefundRes.data;
-
-    // Update payment record
-    await payDoc.ref.update({
-      status: "refund_initiated",
-      refundId: refund.refund_id,
-      refundAmount: refund.refund_amount,
-      refundInitiatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // Revoke the paid upload (decrement allowedPhotoUploads)
-    const studentId = payDoc.data().studentId;
-    await admin.firestore().collection("students").doc(studentId).update({
-      allowedPhotoUploads: admin.firestore.FieldValue.increment(-1),
-    });
-
-    // Notify student
-    await createUserNotification(studentId, "payment", "Refund Initiated",
-      `₹${refund.refund_amount} refund has been initiated. It will reflect in 5-7 business days.`,
-      { refundId: refund.refund_id });
-
-    await logAuditEvent("payment_refund", req.adminRole, req.adminInstitution, { paymentId, refundId: refund.refund_id, amount: refund.refund_amount });
-    return res.json({ success: true, refundId: refund.refund_id, amount: refund.refund_amount });
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// GET /api/payment/history/:userId — Payment history for a user
-app.get("/api/payment/history/:userId", authenticateFirebaseUser, async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const snap = await admin.firestore().collection("payments")
-      .where("studentId", "==", userId)
-      .orderBy("createdAt", "desc")
-      .limit(20)
-      .get();
-    const payments = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    return res.json({ success: true, payments });
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// GET /api/payment/invoice/:paymentDocId — Generate invoice data
-app.get("/api/payment/invoice/:paymentDocId", authenticateFirebaseUser, async (req, res) => {
-  try {
-    const { paymentDocId } = req.params;
-    const doc = await admin.firestore().collection("payments").doc(paymentDocId).get();
-    if (!doc.exists) return res.status(404).json({ success: false, error: "Payment not found" });
-    const data = doc.data();
-
-    // Fetch student name
-    let studentName = "";
-    if (data.studentId) {
-      const studentDoc = await admin.firestore().collection("students").doc(data.studentId).get();
-      if (studentDoc.exists) studentName = studentDoc.data().name || "";
-    }
-
-    return res.json({
-      success: true,
-      invoice: {
-        invoiceNumber: `INV-${doc.id.substring(0, 8).toUpperCase()}`,
-        date: data.createdAt,
-        studentName,
-        studentId: data.studentId,
-        amount: data.amount,
-        purpose: data.purpose || "Photo Change",
-        paymentId: data.paymentId || null,
-        orderId: data.orderId,
-        status: data.status,
-        gateway: data.gateway || "Cashfree",
-      }
-    });
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// POST /api/payment/retry — Retry a failed payment (creates new order for same purpose)
-app.post("/api/payment/retry", paymentLimiter, authenticateFirebaseUser, async (req, res) => {
-  try {
-    const { failedPaymentId } = req.body;
-    if (!failedPaymentId) return res.status(400).json({ success: false, error: "failedPaymentId required" });
-
-    const failedDoc = await admin.firestore().collection("payments").doc(failedPaymentId).get();
-    if (!failedDoc.exists) return res.status(404).json({ success: false, error: "Payment not found" });
-    const failedData = failedDoc.data();
-
-    if (failedData.status === "verified") return res.status(400).json({ success: false, error: "Payment already verified" });
-
-    // Duplicate protection: check if another successful payment exists for same student + purpose
-    const dupeSnap = await admin.firestore().collection("payments")
-      .where("studentId", "==", failedData.studentId)
-      .where("status", "==", "verified")
-      .where("uploadNumber", "==", failedData.uploadNumber)
-      .limit(1)
-      .get();
-    if (!dupeSnap.empty) return res.status(400).json({ success: false, error: "A verified payment already exists for this upload" });
-
-    // Create new Cashfree order for retry
-    const cfOrderId = `retry_${failedData.studentId}_${Date.now()}`;
-    const studentSnap = await admin.firestore().collection("students").doc(failedData.studentId).get();
-    const sd = studentSnap.exists ? studentSnap.data() : {};
-    const cfRes = await axios.post(`${CASHFREE_BASE_URL}/orders`, {
-      order_id: cfOrderId,
-      order_amount: failedData.amount || 15,
-      order_currency: "INR",
-      customer_details: {
-        customer_id: failedData.studentId,
-        customer_email: sd.email || "student@scep.edu",
-        customer_phone: sd.mobile || "9999999999",
-        customer_name: sd.name || "Student",
-      },
-      order_meta: {
-        return_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/return?order_id=${cfOrderId}`,
-        notify_url: `https://bustracker.satpudaengineeringcollege.com/api/api/payment/cashfree-webhook`,
-      },
-      order_note: `Photo replacement #${failedData.uploadNumber} (retry)`,
-    }, {
-      headers: {
-        "x-client-id": CASHFREE_APP_ID,
-        "x-client-secret": CASHFREE_SECRET_KEY,
-        "x-api-version": "2023-08-01",
-        "Content-Type": "application/json",
-      },
-    });
-    const cfOrder = cfRes.data;
-
-    // Save new payment record
-    await admin.firestore().collection("payments").add({
-      studentId: failedData.studentId,
-      uid: failedData.uid,
-      orderId: cfOrderId,
-      paymentSessionId: cfOrder.payment_session_id,
-      amount: failedData.amount,
-      purpose: failedData.purpose || "photo_change",
-      uploadNumber: failedData.uploadNumber,
-      status: "created",
-      gateway: "cashfree",
-      retryOf: failedPaymentId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    return res.json({
-      success: true,
-      orderId: cfOrderId,
-      paymentSessionId: cfOrder.payment_session_id,
-      env: CASHFREE_ENV,
-      amount: failedData.amount,
-    });
-  } catch (e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
 app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFirebaseUser, async (req, res) => {
   try {
     console.log("[BACKEND UPLOAD] ═══ REQUEST RECEIVED ═══");
@@ -7131,19 +6615,17 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     const studentDoc = snap.docs[0];
     const studentId = studentDoc.id;
     const d = studentDoc.data();
-    // SERVER-SIDE limit enforcement using allowedPhotoUploads counter
+    // SERVER-SIDE limit enforcement: hard limit of 3 photo uploads
     const currentYear = new Date().getFullYear();
     let count = d.photoChangeCount || 0;
     if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    // allowedPhotoUploads defaults to 2 (free uploads), incremented by each payment
-    const allowed = d.allowedPhotoUploads ?? 2;
-    console.log("[BACKEND 4] studentId:", studentId, "count:", count, "allowed:", allowed);
-    if (count >= allowed) {
-      console.log("[BACKEND 4] ❌ LIMIT REACHED. count >= allowed");
+    console.log("[BACKEND 4] studentId:", studentId, "count:", count, "limit: 3");
+    if (count >= 3) {
+      console.log("[BACKEND 4] ❌ LIMIT REACHED. count >= 3");
       return res.status(429).json({
-        error: "Photo change limit reached. Payment required.",
+        error: "Maximum 3 photo uploads allowed",
         photoChangeCount: count,
-        allowedPhotoUploads: allowed,
+        photoChangeLimit: 3,
       });
     }
     // Upload via Admin SDK ONLY (client has zero Storage access)
@@ -7166,7 +6648,7 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     console.log("[BACKEND 9] Generating signed URL...");
     const [signedUrl] = await file.getSignedUrl({ action: "read", expires: Date.now() + 7*24*60*60*1000 });
     console.log("[BACKEND 9] ✅ Signed URL generated");
-    // Upload succeeded — NOW increment photoChangeCount (credit NOT consumed, allowedPhotoUploads stays)
+    // Upload succeeded — increment photoChangeCount
     count++;
     const updateData = {
       passPhotoUrl: signedUrl,
@@ -7178,12 +6660,12 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     console.log("[BACKEND 10] Updating Firestore... photoChangeCount:", count);
     await admin.firestore().collection("students").doc(studentId).update(updateData);
     console.log("[BACKEND 10] ✅ Firestore updated");
-    console.log(`[BACKEND 11] ✅ SUCCESS. studentId=${studentId} count=${count}/${allowed}`);
+    console.log(`[BACKEND 11] ✅ SUCCESS. studentId=${studentId} count=${count}/3`);
     return res.json({
       success: true,
       photoUrl: signedUrl,
       photoChangeCount: count,
-      allowedPhotoUploads: allowed,
+      photoChangeLimit: 3,
     });
   } catch (e) {
     console.log("[BACKEND] ❌ EXCEPTION:", e.message);
@@ -7248,7 +6730,6 @@ function classifyError(err) {
   if (msg.includes("firebase") || msg.includes("firestore")) return "FIREBASE";
   if (msg.includes("redis") || msg.includes("econnreset")) return "REDIS";
   if (msg.includes("jwt") || msg.includes("token")) return "AUTH";
-  if (msg.includes("cashfree")) return "PAYMENT";
   if (msg.includes("enomem") || msg.includes("heap")) return "MEMORY";
   return "APPLICATION";
 }
