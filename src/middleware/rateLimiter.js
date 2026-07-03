@@ -9,14 +9,6 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const paymentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 5,
-  message: { error: "Too many payment requests. Slow down." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
 const uploadLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 3,
@@ -33,4 +25,4 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-module.exports = { loginLimiter, paymentLimiter, uploadLimiter, apiLimiter };
+module.exports = { loginLimiter, uploadLimiter, apiLimiter };

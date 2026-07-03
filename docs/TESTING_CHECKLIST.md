@@ -36,14 +36,7 @@
 - [ ] `GET /api/bus-pass/expiry-check/:studentId` → expiry status
 - [ ] Photo upload (1st/2nd) → free
 - [ ] Photo upload (3rd) → requires ₹10 payment
-- [ ] Photo upload (4th+) → requires ₹15 payment
-
-### Payments
-- [ ] `POST /api/payments/create-order` → Razorpay order
-- [ ] `POST /api/payments/verify` with valid signature → success
-- [ ] `POST /api/payments/verify` with invalid signature → 400
-- [ ] Duplicate payment prevention works
-- [ ] Webhook endpoint processes events correctly
+- [ ] Photo upload (4th) → blocked (limit: 3)
 
 ### Notifications
 - [ ] `GET /api/notifications/:userId` → list

@@ -9,7 +9,6 @@
   - SUPER_ADMIN_USER, SUPER_ADMIN_PASS_HASH
   - JWT_SECRET
   - BUSPASS_USERNAME, BUSPASS_PASS_HASH
-  - RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, RAZORPAY_WEBHOOK_SECRET
 - [ ] Verify `serviceAccountKey.json` is present
 - [ ] Verify Redis is running: `redis-cli ping`
 - [ ] Verify `logs/` directory exists: `mkdir -p logs`

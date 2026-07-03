@@ -34,7 +34,6 @@
 | FIREBASE | Firestore/Auth error | Check Firebase console, quota |
 | REDIS | Cache layer failure | Restart Redis, check memory |
 | AUTH | JWT/token issues | Check JWT_SECRET, clock sync |
-| PAYMENT | Razorpay error | Check Razorpay dashboard, API keys |
 | MEMORY | Heap pressure | Restart server, investigate leak |
 | APPLICATION | Code bug | Check stack trace, fix and redeploy |
 
@@ -63,12 +62,6 @@
 2. Verify Firebase Auth token in request headers
 3. Check for composite index errors in PM2 logs
 4. Verify user has the correct `uid` field
-
-#### Payments Failing
-1. Check RAZORPAY_MODE in .env (test vs live)
-2. Verify Razorpay key pair matches mode
-3. Check webhook secret matches Razorpay dashboard
-4. Look for "PAYMENT" classified errors in logs
 
 ## Preventive Measures
 
