@@ -6587,7 +6587,7 @@ app.get("/api/bus-pass/student/:studentId", authenticateFirebaseUser, async (req
       course: d.course||"", year: d.year||d.academicYear||"", busId: d.busId||"",
       city: d.city||"", busPassId: d.busPassId||null, verifiedForBusPass: d.verifiedForBusPass||false,
       busPassExpiry: d.busPassExpiry||null, session: d.session||"", status,
-      passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, photoChangeLimit: 2,
+      passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, allowedPhotoUploads: d.allowedPhotoUploads ?? 2,
     }});
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
