@@ -1645,8 +1645,8 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
 
     const currentMinutes = indiaTime.getHours() * 60 + indiaTime.getMinutes();
 
-    const startMinutes = 6 * 60;      // 6:00 AM  — slightly earlier for early buses
-    const endMinutes   = 12 * 60;     // 12:00 PM — extended to catch late trips
+    const startMinutes = 6 * 60;      // 6:00 AM
+    const endMinutes   = 12 * 60;     // 12:00 PM
 
     if (currentMinutes < startMinutes || currentMinutes > endMinutes) {
       return res.json({
@@ -1654,12 +1654,26 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
         message: "Tracking time closed",
       });
     }
-    console.log("IST TIME:", indiaTime);
-    console.log("📥 LOCATION API HIT");
-    console.log(req.body);
-    const { studentId, busId, lat, lng, fcmToken } = req.body;
+
+    const { studentId, busId, lat, lng, fcmToken, accuracy, deviceTime } = req.body;
+
+    // ── PM2 LOG: Student Location Hit ────────────────────────────────────
+    const istStr = indiaTime.toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: false });
+    const clientIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
+    console.log("====================================================");
+    console.log("📍 STUDENT LOCATION HIT");
+    console.log(`  Time       : ${istStr}`);
+    console.log(`  Student ID : ${studentId || "N/A"}`);
+    console.log(`  Bus ID     : ${busId || "N/A"}`);
+    console.log(`  Latitude   : ${lat ?? "N/A"}`);
+    console.log(`  Longitude  : ${lng ?? "N/A"}`);
+    console.log(`  Accuracy   : ${accuracy ?? "N/A"}`);
+    console.log(`  Device Time: ${deviceTime || "N/A"}`);
+    console.log(`  IP         : ${clientIp}`);
+    console.log("====================================================");
 
     if (!studentId || !busId || lat == null || lng == null) {
+      console.error(`❌ STUDENT LOCATION FAILED | Student: ${studentId || "N/A"} | Reason: Missing fields`);
       return res.status(400).json({ error: "Missing fields" });
     }
 
@@ -1678,6 +1692,7 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
       }
     }
     if (!isOwner) {
+      console.error(`❌ STUDENT LOCATION FAILED | Student: ${studentId} | Reason: Ownership denied`);
       return res.status(403).json({ error: "Access denied — you can only update your own location" });
     }
 
@@ -1685,10 +1700,12 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
     const latNum = parseFloat(lat);
     const lngNum = parseFloat(lng);
     if (isNaN(latNum) || isNaN(lngNum) || latNum < 6 || latNum > 37 || lngNum < 68 || lngNum > 98) {
+      console.error(`❌ STUDENT LOCATION FAILED | Student: ${studentId} | Reason: Invalid coordinates`);
       return res.status(400).json({ error: "Invalid coordinates" });
     }
     // Validate studentId format
     if (typeof studentId !== "string" || studentId.length > 50) {
+      console.error(`❌ STUDENT LOCATION FAILED | Student: ${studentId} | Reason: Invalid studentId`);
       return res.status(400).json({ error: "Invalid studentId" });
     }
 
@@ -1774,9 +1791,12 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
     busState[busId] = busState[busId] || {};
     busState[busId].lastSeen = Date.now();
 
+    console.log(`✅ STUDENT LOCATION SAVED | Student: ${studentId}`);
+
     return res.json({ success: true });
   } catch (e) {
-    console.log("❌ LOCATION ERROR:", e);
+    const failedId = req.body?.studentId || "unknown";
+    console.error(`❌ STUDENT LOCATION FAILED | Student: ${failedId} | Reason: ${e.message}`);
     return res.status(500).json({ error: "Server error" });
   }
 });
@@ -1894,7 +1914,7 @@ async function fetchSMLData(retry = 0) {
 
     // retry timeout
     if (err.code === "ECONNABORTED" && retry < 10) {
-      console.log("⏳ RETRYING SML API...");
+      console.log(`⏳ Retrying SML API (attempt ${retry + 1})...`);
       return fetchSMLData(retry + 1);
     }
 
@@ -2115,7 +2135,8 @@ function computeGpsReliability(provider, busId, parsedMs, serverNow) {
   // Debug log — only for non-LIVE states (reduces log volume for healthy buses)
   if (gpsState !== GPS_STATE.LIVE) {
     const thresholdRange = gpsState === GPS_STATE.UPDATING ? "181-300" : ">300";
-    console.log(`[GPS STATE] bus=${busId} age=${gpsAgeSeconds}s state=${gpsState} threshold=${thresholdRange} provider=${provider} gpsTimeIst=${lastGpsUpdateIst}`);
+    // Suppressed in production — too noisy for PM2 logs
+    // console.log(`[GPS STATE] bus=${busId} age=${gpsAgeSeconds}s state=${gpsState} threshold=${thresholdRange} provider=${provider} gpsTimeIst=${lastGpsUpdateIst}`);
   }
 
   return { gpsAgeSeconds, gpsState, lastGpsUpdateUtc, lastGpsUpdateIst };
@@ -2129,7 +2150,7 @@ function detectStalePacket(provider, busId, lat, lng, speed, rawGpsTime) {
   const prev = _lastGpsPacket[busId];
   if (prev) {
     if (prev.lat === lat && prev.lng === lng && prev.speed === speed && prev.time === rawGpsTime && rawGpsTime) {
-      console.log(`[GPS STALE] provider=${provider} bus=${busId} sameLocation=true sameSpeed=true sameTimestamp=true`);
+      // Suppressed — too noisy
     }
     // Reuse existing object (avoid GC pressure)
     prev.lat = lat; prev.lng = lng; prev.speed = speed; prev.time = rawGpsTime;
@@ -6514,9 +6535,10 @@ async function authenticateFirebaseUser(req, res, next) {
   try {
     const idToken = authHeader.slice(7);
     const decoded = await admin.auth().verifyIdToken(idToken);
-    req.firebaseUid = decoded.uid; // ONLY source of truth for user identity
+    req.firebaseUid = decoded.uid;
     next();
   } catch (e) {
+    console.log("[AUTH] ❌ Token verification failed:", e.message);
     return res.status(401).json({ error: "Invalid or expired authentication token" });
   }
 }
