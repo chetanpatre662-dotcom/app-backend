@@ -1677,20 +1677,61 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
       return res.status(400).json({ error: "Missing fields" });
     }
 
-    // ── Ownership verification: Firebase UID must match the student document ──
-    const collections = ["students", "parents", "faculty"];
+    // ── Ownership verification: Use in-memory cache (zero Firestore reads) ──
+    // The server maintains realtime onSnapshot listeners on students/parents/faculty.
+    // _studentMap, _parentMap, _facultyMap are always up-to-date.
     let isOwner = false;
-    for (const col of collections) {
-      const doc = await admin.firestore().collection(col).doc(studentId).get();
-      if (doc.exists) {
-        if (doc.data().uid === req.firebaseUid) { isOwner = true; break; }
-        // Reverse lookup: UID might match a different doc ID format
-        const uidSnap = await admin.firestore().collection(col)
-          .where("uid", "==", req.firebaseUid).limit(1).get();
-        if (!uidSnap.empty && uidSnap.docs[0].id === studentId) { isOwner = true; break; }
-        break; // Doc found but UID doesn't match
+    let cachedDoc = null;
+
+    // Ensure cache listeners are attached (lazy init on first request after restart)
+    if (!_snapshotListenersAttached) {
+      _attachSnapshotListeners();
+    }
+
+    // If cache is populated, use it (O(1) lookup, zero Firestore reads)
+    const cachePopulated = _studentMap.size > 0 || _parentMap.size > 0 || _facultyMap.size > 0;
+
+    if (cachePopulated) {
+      // Check by document ID first (primary path)
+      cachedDoc = _studentMap.get(studentId) || _parentMap.get(studentId) || _facultyMap.get(studentId);
+      if (cachedDoc && cachedDoc.uid === req.firebaseUid) {
+        isOwner = true;
+      }
+
+      // Fallback: reverse lookup by UID (if doc ID doesn't match directly)
+      if (!isOwner) {
+        for (const map of [_studentMap, _parentMap, _facultyMap]) {
+          for (const [docId, entry] of map.entries()) {
+            if (entry.uid === req.firebaseUid && docId === studentId) {
+              isOwner = true;
+              cachedDoc = entry;
+              break;
+            }
+          }
+          if (isOwner) break;
+        }
+      }
+    } else {
+      // Cache not yet loaded (server just restarted) — graceful Firestore fallback
+      // This only happens for the first few requests after restart (~2-3 seconds)
+      try {
+        for (const col of ["students", "parents", "faculty"]) {
+          const doc = await admin.firestore().collection(col).doc(studentId).get();
+          if (doc.exists) {
+            if (doc.data().uid === req.firebaseUid) {
+              isOwner = true;
+              cachedDoc = doc.data();
+            }
+            break;
+          }
+        }
+      } catch (e) {
+        // Firestore unavailable during startup — REJECT (never skip ownership verification)
+        console.error(`❌ STUDENT LOCATION FAILED | Student: ${studentId} | Reason: Verification unavailable (${e.message})`);
+        return res.status(503).json({ error: "Service temporarily unavailable. Please retry in a few seconds." });
       }
     }
+
     if (!isOwner) {
       console.error(`❌ STUDENT LOCATION FAILED | Student: ${studentId} | Reason: Ownership denied`);
       return res.status(403).json({ error: "Access denied — you can only update your own location" });
@@ -1709,67 +1750,18 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
       return res.status(400).json({ error: "Invalid studentId" });
     }
 
-    // ── Firestore ↔ Redis mismatch check ─────────────────────────────────
-    // Verify the incoming studentId/busId matches the Firestore document.
-    // Log any mismatch but do NOT reject the request — location tracking
-    // must continue even if Firestore is temporarily unavailable.
-    try {
-      const existingRedis = await redis.get(`student:${studentId}`);
-
-      // Look up the user's Firestore document across all three collections
-      const collections = ["students", "parents", "faculty"];
-      let firestoreDoc = null;
-      let firestoreCol = null;
-
-      for (const col of collections) {
-        const snap = await admin.firestore()
-          .collection(col)
-          .doc(studentId)
-          .get();
-        if (snap.exists) {
-          firestoreDoc = snap.data();
-          firestoreCol = col;
-          break;
-        }
-      }
-
-      if (firestoreDoc) {
-        // ── Check 1: busId mismatch ──────────────────────────────────────
-        const fsBusId = firestoreDoc.busId || "";
-        // Normalise both to "BUS-X" format for comparison
-        const normFS  = fsBusId.toUpperCase().replace(/\s+/g, "-");
-        const normReq = String(busId).toUpperCase().replace(/\s+/g, "-");
-        if (normFS !== normReq) {
-          console.warn("⚠️  FIREBASE↔REDIS MISMATCH [busId]", {
-            studentId,
-            firestoreCollection: firestoreCol,
-            firestoreBusId: fsBusId,
-            requestBusId:   busId,
-          });
-        }
-
-        // ── Check 2: stale Redis entry (busId changed since last write) ──
-        if (existingRedis && existingRedis.busId) {
-          const normRedis = String(existingRedis.busId).toUpperCase().replace(/\s+/g, "-");
-          if (normRedis !== normReq) {
-            console.warn("⚠️  STALE REDIS ENTRY [busId changed]", {
-              studentId,
-              redisBusId:   existingRedis.busId,
-              requestBusId: busId,
-              action:       "overwriting with fresh data",
-            });
-          }
-        }
-      } else {
-        // Document not found by doc ID — may be a uid-keyed doc or deleted user
-        console.warn("⚠️  FIREBASE↔REDIS MISMATCH [doc not found]", {
+    // ── BusId mismatch check (from in-memory cache — zero Firestore reads) ──
+    if (cachedDoc) {
+      const fsBusId = cachedDoc.busId || "";
+      const normFS  = fsBusId.toUpperCase().replace(/\s+/g, "-");
+      const normReq = String(busId).toUpperCase().replace(/\s+/g, "-");
+      if (fsBusId && normFS !== normReq) {
+        console.warn("⚠️  CACHE↔REQUEST MISMATCH [busId]", {
           studentId,
-          note: "No Firestore document found with this ID in students/parents/faculty",
+          cachedBusId: fsBusId,
+          requestBusId: busId,
         });
       }
-    } catch (mismatchErr) {
-      // Mismatch check is best-effort — never block location tracking
-      console.log("⚠️  Mismatch check error (non-fatal):", mismatchErr.message);
     }
 
     const payload = {
