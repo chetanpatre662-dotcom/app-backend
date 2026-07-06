@@ -38,6 +38,33 @@ const busStartTimes = {};
 let routeCache = {};
 const ROUTE_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min in-memory TTL (matches Redis TTL)
 const tripStatusMap = {};
+// ── In-memory today's trip history (updated instantly on trip start/end) ─────
+// Keyed by date string. Resets daily. Serves /admin/trips without Firestore.
+let _todayTripsCache = { date: "", trips: [] };
+
+// Rebuild today's trip cache from Firestore on cold start
+async function _rebuildTodayTripsCache() {
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const snap = await admin.firestore().collection("trip_logs")
+      .where("date", "==", today).get();
+    const trips = snap.docs.map(d => {
+      const data = d.data();
+      return {
+        tripId: data.tripId, busId: data.busId,
+        startTime: data.startTime || null, endTime: data.endTime || null,
+        distance: data.distance || 0, duration: data.duration || 0,
+        passengerCount: data.passengerCount || 0,
+        date: data.date, status: data.status || "unknown",
+        institution: data.institution || "college",
+      };
+    });
+    _todayTripsCache = { date: today, trips };
+    console.log(`[TRIP CACHE] Rebuilt from Firestore: ${trips.length} trips for ${today}`);
+  } catch (e) {
+    console.log("[TRIP CACHE] Rebuild error:", e.message);
+  }
+}
 const busCollegeArrival = {};
 let latestBuses = [];
 let recentActivities = [];
@@ -437,6 +464,7 @@ async function handleAttendance(bus, students) {
             {
               studentId:    student.studentId,
               studentName:  student.name  || "",
+              city:         student.city  || "",
               branch:       student.branch || "",
               course:       student.course || "",
               studentType:  student.studentType || "",
@@ -456,6 +484,31 @@ async function handleAttendance(bus, students) {
           );
 
         console.log("✅ Boarded (confirmed)", student.studentId);
+
+        // ── BOARDING LOG: Save dedicated boarding record ─────────────────────
+        const boardingLogId = `${bus.busId}_${student.studentId}_${today}`;
+        admin.firestore().collection("boarding_logs").doc(boardingLogId).set({
+          userId:       student.studentId,
+          userName:     student.name || "",
+          city:         student.city || "",
+          busId:        bus.busId,
+          boardingTime: admin.firestore.FieldValue.serverTimestamp(),
+          boardingDate: today,
+          institution:  student.institution || "college",
+          tripId:       tripStatusMap[bus.busId]?.currentTripId || null,
+        }, { merge: true }).catch(e => console.log(`[BOARDING_LOG] Error: ${e.message}`));
+
+        // ── INCREMENT trip passenger count (if trip is active) ───────────────
+        if (tripStatusMap[bus.busId]?.currentTripId) {
+          const activeTripId = tripStatusMap[bus.busId].currentTripId;
+          admin.firestore().collection("trip_logs").doc(activeTripId).update({
+            passengerCount: admin.firestore.FieldValue.increment(1),
+          }).catch(e => console.log(`[TRIP] Passenger increment error: ${e.message}`));
+
+          // Also update in-memory cache (live monitoring)
+          const cachedTrip = _todayTripsCache.trips.find(t => t.tripId === activeTripId);
+          if (cachedTrip) cachedTrip.passengerCount = (cachedTrip.passengerCount || 0) + 1;
+        }
       }
     }
     // =========================
@@ -2803,6 +2856,130 @@ async function handleBus(bus, students) {
     }
   }
 
+  // ── AUTOMATIC TRIP LOGGING ─────────────────────────────────────────────────
+  // Creates trip_log entries in Firestore when bus starts/stops moving.
+  // Uses debounce: bus must be stopped for 3 consecutive poll cycles (~30s)
+  // to confirm trip end. This prevents GPS flicker from creating false trips.
+  
+  if (!tripStatusMap[busId]) {
+    // Initialize trip tracking state for this bus
+    tripStatusMap[busId] = {
+      currentTripId: null,
+      tripStartTime: null,
+      tripStartKm: 0,
+      stoppedCycles: 0,       // Consecutive cycles with tripActive=false
+      STOP_DEBOUNCE: 3,       // Required consecutive stopped cycles to end trip
+    };
+    // Restore from Redis on cold start
+    const savedTrip = await redis.get(`tripState:${busId}`);
+    if (savedTrip && typeof savedTrip === "object") {
+      Object.assign(tripStatusMap[busId], savedTrip);
+    }
+  }
+
+  const tripState = tripStatusMap[busId];
+
+  // Trip START: tripActive transitions to true and no active trip
+  if (bus.tripActive && !tripState.currentTripId) {
+    tripState.stoppedCycles = 0;
+    const tripId = `${busId}_${today}_${Date.now()}`;
+    const startIst = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit" });
+    
+    tripState.currentTripId = tripId;
+    tripState.tripStartTime = new Date().toISOString();
+    tripState.tripStartKm = busDistanceTracker[busId]?.totalKm || 0;
+
+    // Write to Firestore (non-blocking)
+    admin.firestore().collection("trip_logs").doc(tripId).set({
+      tripId,
+      busId,
+      driverId: bus.driverMobile || "",
+      startTime: startIst,
+      startTimeISO: tripState.tripStartTime,
+      endTime: null,
+      distance: 0,
+      duration: 0,
+      passengerCount: 0,
+      date: today,
+      status: "running",
+      institution: bus.routeType || "college",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    }).catch(e => console.log(`[TRIP] Error creating trip ${tripId}: ${e.message}`));
+
+    // Persist to Redis for crash recovery
+    await redis.setEx(`tripState:${busId}`, 86400, tripState);
+    console.log(`🚌 TRIP STARTED | ${busId} | tripId=${tripId}`);
+
+    // Update in-memory trip cache (instant, no Firestore read needed by frontend)
+    if (_todayTripsCache.date !== today) { _todayTripsCache = { date: today, trips: [] }; }
+    _todayTripsCache.trips.push({
+      tripId, busId, startTime: startIst, endTime: null,
+      distance: 0, duration: 0, passengerCount: 0,
+      date: today, status: "running", institution: bus.routeType || "college",
+    });
+  }
+
+  // Trip CONTINUE: reset stopped counter when bus is moving
+  if (bus.tripActive && tripState.currentTripId) {
+    tripState.stoppedCycles = 0;
+  }
+
+  // Trip STOP detection: count consecutive stopped cycles
+  if (!bus.tripActive && tripState.currentTripId) {
+    tripState.stoppedCycles++;
+
+    // Only end trip after sustained stop (debounce)
+    if (tripState.stoppedCycles >= tripState.STOP_DEBOUNCE) {
+      const endIst = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit" });
+      const durationMs = Date.now() - new Date(tripState.tripStartTime).getTime();
+      const durationMin = Math.round(durationMs / 60000);
+      const distanceKm = ((busDistanceTracker[busId]?.totalKm || 0) - tripState.tripStartKm).toFixed(1);
+
+      // Count passengers boarded during this trip (from today's attendance)
+      const attSnap = await admin.firestore().collection("attendance")
+        .where("busId", "==", busId)
+        .where("date", "==", today)
+        .where("boarded", "==", true)
+        .get().catch(() => ({ docs: [] }));
+      const passengerCount = attSnap.docs ? attSnap.docs.length : 0;
+
+      // Update Firestore trip_log (merge: true creates doc if initial write failed)
+      admin.firestore().collection("trip_logs").doc(tripState.currentTripId).set({
+        tripId: tripState.currentTripId,
+        busId,
+        date: today,
+        institution: bus.routeType || "college",
+        endTime: endIst,
+        endTimeISO: new Date().toISOString(),
+        distance: parseFloat(distanceKm),
+        duration: durationMin,
+        passengerCount,
+        status: "completed",
+      }, { merge: true }).catch(e => console.log(`[TRIP] Error ending trip: ${e.message}`));
+
+      console.log(`🚌 TRIP ENDED | ${busId} | duration=${durationMin}min distance=${distanceKm}km passengers=${passengerCount}`);
+
+      // Update in-memory trip cache (instant)
+      const cachedTrip = _todayTripsCache.trips.find(t => t.tripId === tripState.currentTripId);
+      if (cachedTrip) {
+        cachedTrip.endTime = endIst;
+        cachedTrip.distance = parseFloat(distanceKm);
+        cachedTrip.duration = durationMin;
+        cachedTrip.passengerCount = passengerCount;
+        cachedTrip.status = "completed";
+      }
+
+      // Reset trip state
+      tripState.currentTripId = null;
+      tripState.tripStartTime = null;
+      tripState.tripStartKm = 0;
+      tripState.stoppedCycles = 0;
+
+      // Persist reset to Redis
+      await redis.setEx(`tripState:${busId}`, 86400, tripState);
+    }
+  }
+
   // ── Persist current tripActive to Redis so restart knows the last state ───
   const newState = { ...prev, tripActive: bus.tripActive };
   busState[busId] = newState;
@@ -3339,6 +3516,9 @@ wss.on("connection", (ws, req) => {
 
 app.get("/admin/attendance-history", adminAuth, async (req, res) => {
   try {
+    if (req.adminInstitution === "school") {
+      return res.status(403).json({ error: "Attendance not available for school admins" });
+    }
     const months = Number(req.query.months || 6);
 
     const fromDate = new Date();
@@ -3373,6 +3553,10 @@ app.get("/admin/attendance-history", adminAuth, async (req, res) => {
 
 app.get("/admin/attendance", adminAuth, async (req, res) => {
   try {
+    // School admin restriction: no attendance access
+    if (req.adminInstitution === "school") {
+      return res.status(403).json({ error: "Attendance not available for school admins" });
+    }
     const inst = resolveInstitutionFilter(req, req.query.institution);
     const today = new Date().toISOString().split("T")[0];
     const date = req.query.date || today;
@@ -3408,6 +3592,9 @@ app.get("/admin/attendance", adminAuth, async (req, res) => {
 
 app.get("/admin/attendance-month", adminAuth, async (req, res) => {
   try {
+    if (req.adminInstitution === "school") {
+      return res.status(403).json({ error: "Attendance not available for school admins" });
+    }
     const monthKey = req.query.monthKey || getMonthKey();
 
     const snap = await admin
@@ -4115,6 +4302,10 @@ app.get("/admin/users-by-institution", adminAuth, async (req, res) => {
 ========================= */
 app.get("/admin/attendance-by-institution", adminAuth, async (req, res) => {
   try {
+    // School admin restriction: no attendance access
+    if (req.adminInstitution === "school") {
+      return res.status(403).json({ error: "Attendance not available for school admins" });
+    }
     const inst = (req.query.institution || "").toLowerCase();
     const date = req.query.date || new Date().toISOString().split("T")[0];
 
@@ -6777,6 +6968,346 @@ process.on("uncaughtException", (err) => {
   setTimeout(() => process.exit(1), 1000);
 });
 
+/* =========================
+   TRIP LOGS & REPORTS APIs
+========================= */
+
+// ── Input validation helpers for report APIs ────────────────────────────────
+const VALID_TRIP_STATUSES = ["running", "completed", "not_started"];
+function isValidDate(str) { return /^\d{4}-\d{2}-\d{2}$/.test(str); }
+function isValidBusId(str) { return typeof str === "string" && str.length <= 20 && /^[A-Za-z0-9\-]+$/.test(str); }
+function sanitizeTripId(str) { return typeof str === "string" && str.length <= 80 && /^[A-Za-z0-9_\-]+$/.test(str); }
+
+// POST /admin/trip-log — Record a trip start/end (called by GPS engine or manually)
+app.post("/admin/trip-log", adminAuth, async (req, res) => {
+  try {
+    const { busId, driverId, startTime, endTime, distance, duration, passengerCount, date, status } = req.body;
+    if (!busId || !date) return res.status(400).json({ error: "busId and date required" });
+    if (!isValidDate(date)) return res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
+    if (!isValidBusId(busId)) return res.status(400).json({ error: "Invalid busId format" });
+    if (status && !VALID_TRIP_STATUSES.includes(status)) return res.status(400).json({ error: "Invalid status. Allowed: running, completed, not_started" });
+
+    const tripId = `${busId.toUpperCase()}_${date}_${Date.now()}`;
+    const tripData = {
+      tripId,
+      busId: busId.toUpperCase(),
+      driverId: driverId || "",
+      startTime: startTime || null,
+      endTime: endTime || null,
+      distance: parseFloat(distance) || 0,
+      duration: parseInt(duration) || 0,
+      passengerCount: parseInt(passengerCount) || 0,
+      date,
+      status: status || "running",
+      institution: req.adminInstitution || "college",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    await admin.firestore().collection("trip_logs").doc(tripId).set(tripData);
+    return res.json({ success: true, tripId });
+  } catch (e) {
+    console.error("[TRIP-LOG] POST error:", e.message);
+    return res.status(500).json({ error: "Failed to create trip log" });
+  }
+});
+
+// PUT /admin/trip-log/:tripId — Update trip (end time, distance, passengers)
+app.put("/admin/trip-log/:tripId", adminAuth, async (req, res) => {
+  try {
+    const { tripId } = req.params;
+    if (!sanitizeTripId(tripId)) return res.status(400).json({ error: "Invalid tripId format" });
+
+    const updates = {};
+    if (req.body.endTime) updates.endTime = req.body.endTime;
+    if (req.body.distance != null) updates.distance = parseFloat(req.body.distance);
+    if (req.body.duration != null) updates.duration = parseInt(req.body.duration);
+    if (req.body.passengerCount != null) updates.passengerCount = parseInt(req.body.passengerCount);
+    if (req.body.status) {
+      if (!VALID_TRIP_STATUSES.includes(req.body.status)) return res.status(400).json({ error: "Invalid status" });
+      updates.status = req.body.status;
+    }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: "No valid fields to update" });
+    updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+
+    await admin.firestore().collection("trip_logs").doc(tripId).update(updates);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error("[TRIP-LOG] PUT error:", e.message);
+    return res.status(500).json({ error: "Failed to update trip log" });
+  }
+});
+
+// GET /admin/trips — Get trip logs with filters
+// Also supports fetching all buses at once (when no busId specified)
+// For today's data: serves from in-memory cache (0 Firestore reads, instant)
+// For historical data: reads from Firestore
+app.get("/admin/trips", adminAuth, async (req, res) => {
+  try {
+    const { date, busId, startDate, endDate } = req.query;
+    if (date && !isValidDate(date)) return res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
+    if (startDate && !isValidDate(startDate)) return res.status(400).json({ error: "Invalid startDate format" });
+    if (endDate && !isValidDate(endDate)) return res.status(400).json({ error: "Invalid endDate format" });
+    if (busId && !isValidBusId(busId)) return res.status(400).json({ error: "Invalid busId format" });
+
+    const inst = resolveInstitutionFilter(req, req.query.institution);
+    const today = new Date().toISOString().split("T")[0];
+
+    // ── FAST PATH: today's trips from in-memory cache (zero Firestore reads) ──
+    if (date === today && !startDate && !endDate && _todayTripsCache.date === today) {
+      let trips = [..._todayTripsCache.trips];
+      if (busId) trips = trips.filter(t => t.busId === busId.toUpperCase());
+      if (inst && inst !== "all") trips = trips.filter(t => t.institution === inst);
+
+      // Also include currently running trips from tripStatusMap (live distance/duration)
+      for (const t of trips) {
+        if (t.status === "running") {
+          const ts = tripStatusMap[t.busId];
+          if (ts && ts.tripStartTime) {
+            t.duration = Math.round((Date.now() - new Date(ts.tripStartTime).getTime()) / 60000);
+            t.distance = parseFloat(((busDistanceTracker[t.busId]?.totalKm || 0) - (ts.tripStartKm || 0)).toFixed(1));
+          }
+        }
+      }
+
+      const byBus = {};
+      for (const t of trips) { if (!byBus[t.busId]) byBus[t.busId] = []; byBus[t.busId].push(t); }
+      return res.json({ success: true, count: trips.length, trips, byBus });
+    }
+
+    // ── SLOW PATH: historical data from Firestore ─────────────────────────────
+    let query = admin.firestore().collection("trip_logs").orderBy("createdAt", "desc");
+    if (date) query = query.where("date", "==", date);
+    if (busId) query = query.where("busId", "==", busId.toUpperCase());
+    if (inst && inst !== "all") query = query.where("institution", "==", inst);
+
+    const snap = await query.limit(500).get();
+    let trips = snap.docs.map(d => {
+      const data = d.data();
+      return {
+        id: d.id,
+        tripId: data.tripId,
+        busId: data.busId,
+        startTime: data.startTime || null,
+        endTime: data.endTime || null,
+        distance: data.distance || 0,
+        duration: data.duration || 0,
+        passengerCount: data.passengerCount || 0,
+        date: data.date,
+        status: data.status || "unknown",
+        institution: data.institution,
+      };
+    });
+
+    if (startDate && endDate) {
+      trips = trips.filter(t => t.date >= startDate && t.date <= endDate);
+    }
+
+    const byBus = {};
+    for (const t of trips) { if (!byBus[t.busId]) byBus[t.busId] = []; byBus[t.busId].push(t); }
+    return res.json({ success: true, count: trips.length, trips, byBus });
+  } catch (e) {
+    console.error("[TRIPS] GET error:", e.message);
+    return res.status(500).json({ error: "Failed to fetch trips" });
+  }
+});
+
+// GET /admin/reports/bus — Bus-wise report with trips and boarding details
+app.get("/admin/reports/bus", adminAuth, async (req, res) => {
+  try {
+    const { date, startDate, endDate, busId } = req.query;
+    if (date && !isValidDate(date)) return res.status(400).json({ error: "Invalid date format (YYYY-MM-DD)" });
+    if (startDate && !isValidDate(startDate)) return res.status(400).json({ error: "Invalid startDate format" });
+    if (endDate && !isValidDate(endDate)) return res.status(400).json({ error: "Invalid endDate format" });
+    if (busId && !isValidBusId(busId)) return res.status(400).json({ error: "Invalid busId format" });
+
+    const inst = resolveInstitutionFilter(req, req.query.institution);
+    // Attendance visibility: school admin cannot see passenger/boarding data
+    // College admin + Super admin can see everything for their institution
+    const isSchoolAdmin = req.adminInstitution === "school";
+
+    // Redis cache (60s TTL) — avoids repeated heavy Firestore queries
+    const cacheKey = `report:bus:${inst||"all"}:${date||""}:${startDate||""}:${endDate||""}:${busId||""}:${isSchoolAdmin?"s":"f"}`;
+    if (redisReady) {
+      const cached = await redis.get(cacheKey);
+      if (cached && typeof cached === "object") return res.json(cached);
+    }
+
+    // Get trips
+    let tripQuery = admin.firestore().collection("trip_logs");
+    if (date) tripQuery = tripQuery.where("date", "==", date);
+    if (busId) tripQuery = tripQuery.where("busId", "==", busId.toUpperCase());
+    const tripSnap = await tripQuery.get();
+    let trips = tripSnap.docs.map(d => d.data());
+    if (startDate && endDate) trips = trips.filter(t => t.date >= startDate && t.date <= endDate);
+    if (inst && inst !== "all") trips = trips.filter(t => t.institution === inst);
+
+    // Get attendance/boarding data (skip for school admin)
+    let boardings = [];
+    if (!isSchoolAdmin) {
+      let attQuery = admin.firestore().collection("attendance");
+      if (date) attQuery = attQuery.where("date", "==", date);
+      if (busId) attQuery = attQuery.where("busId", "==", busId.toUpperCase());
+      const attSnap = await attQuery.get();
+      boardings = attSnap.docs.map(d => d.data()).filter(a => a.boarded);
+      if (startDate && endDate) boardings = boardings.filter(a => a.date >= startDate && a.date <= endDate);
+    }
+
+    // Get student names from cache — build O(1) lookup Map
+    const allUsers = studentCache.length > 0 ? studentCache : await getStudentsCached();
+    const userMap = new Map();
+    for (const u of allUsers) { if (u.studentId) userMap.set(u.studentId, u); }
+
+    // Group by bus
+    const busGroups = {};
+    for (const trip of trips) {
+      if (!busGroups[trip.busId]) {
+        busGroups[trip.busId] = { busId: trip.busId, driverId: trip.driverId || "", trips: [], boardings: [] };
+      }
+      const tripEntry = { ...trip };
+      if (isSchoolAdmin) delete tripEntry.passengerCount;
+      busGroups[trip.busId].trips.push(tripEntry);
+    }
+
+    for (const b of boardings) {
+      if (!busGroups[b.busId]) busGroups[b.busId] = { busId: b.busId, driverId: "", trips: [], boardings: [] };
+      const user = userMap.get(b.studentId);
+      busGroups[b.busId].boardings.push({
+        studentId: b.studentId,
+        name: user?.name || b.studentId,
+        city: user?.city || "",
+        busId: b.busId,
+        boardingTime: b.boardingTime,
+        date: b.date,
+        userType: user?.role || user?.studentType || "student",
+        institution: user?.institution || "college",
+      });
+    }
+
+    // Summary per bus
+    const report = Object.values(busGroups).map(bg => ({
+      busId: bg.busId,
+      driver: bg.driverId,
+      totalTrips: bg.trips.length,
+      totalDistance: bg.trips.reduce((sum, t) => sum + (t.distance || 0), 0).toFixed(1),
+      totalPassengers: !isSchoolAdmin ? bg.boardings.length : undefined,
+      trips: bg.trips,
+      boardings: !isSchoolAdmin ? bg.boardings : undefined,
+    }));
+
+    const responseJson = { success: true, report, canViewAttendance: !isSchoolAdmin };
+    // Cache for 60 seconds
+    if (redisReady) redis.setEx(cacheKey, 60, responseJson).catch(() => {});
+    return res.json(responseJson);
+  } catch (e) {
+    console.error("[REPORTS/BUS] Error:", e.message);
+    return res.status(500).json({ error: "Failed to generate bus report" });
+  }
+});
+
+// GET /admin/reports/attendance — Attendance report with filters
+// SECURITY: School admins cannot access attendance data (operational reports only)
+app.get("/admin/reports/attendance", adminAuth, async (req, res) => {
+  try {
+    // School admin restriction: no attendance access
+    if (req.adminInstitution === "school") {
+      return res.status(403).json({ error: "Attendance reports are not available for school admins" });
+    }
+
+    const { date, startDate, endDate, busId } = req.query;
+    const inst = resolveInstitutionFilter(req, req.query.institution);
+
+    let query = admin.firestore().collection("attendance");
+    if (date) query = query.where("date", "==", date);
+    if (busId) query = query.where("busId", "==", busId.toUpperCase());
+    const snap = await query.get();
+    let records = snap.docs.map(d => d.data()).filter(a => a.boarded);
+    if (startDate && endDate) records = records.filter(a => a.date >= startDate && a.date <= endDate);
+
+    // Enrich with user details from cache — O(1) Map lookup
+    const allUsers = studentCache.length > 0 ? studentCache : await getStudentsCached();
+    const userMap = new Map();
+    for (const u of allUsers) { if (u.studentId) userMap.set(u.studentId, u); }
+
+    const enriched = records.map(r => {
+      const user = userMap.get(r.studentId);
+      return {
+        studentId: r.studentId,
+        name: user?.name || r.studentId,
+        city: user?.city || "",
+        busId: r.busId,
+        boardingTime: r.boardingTime,
+        date: r.date,
+        userType: user?.role || user?.studentType || "student",
+        institution: user?.institution || "college",
+      };
+    });
+
+    // Institution filter
+    let filtered = enriched;
+    if (inst && inst !== "all") filtered = enriched.filter(r => r.institution === inst);
+
+    // Group by bus
+    const busBuckets = {};
+    for (const r of filtered) {
+      if (!busBuckets[r.busId]) busBuckets[r.busId] = [];
+      busBuckets[r.busId].push(r);
+    }
+
+    return res.json({ success: true, total: filtered.length, byBus: busBuckets, records: filtered });
+  } catch (e) {
+    console.error("[REPORTS/ATTENDANCE] Error:", e.message);
+    return res.status(500).json({ error: "Failed to generate attendance report" });
+  }
+});
+
+// GET /admin/reports/dashboard-stats — Today's summary for dashboard cards
+app.get("/admin/reports/dashboard-stats", adminAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const inst = resolveInstitutionFilter(req, req.query.institution);
+
+    // Redis cache (30s TTL)
+    const statsCacheKey = `report:stats:${inst||"all"}:${today}`;
+    if (redisReady) {
+      const cached = await redis.get(statsCacheKey);
+      if (cached && typeof cached === "object") return res.json(cached);
+    }
+
+    // Today's trips
+    let tripQuery = admin.firestore().collection("trip_logs").where("date", "==", today);
+    if (inst && inst !== "all") tripQuery = tripQuery.where("institution", "==", inst);
+    const tripSnap = await tripQuery.get();
+    const trips = tripSnap.docs.map(d => d.data());
+
+    const totalTrips = trips.length;
+    const totalDistance = trips.reduce((sum, t) => sum + (t.distance || 0), 0).toFixed(1);
+    const runningBuses = trips.filter(t => t.status === "running").length;
+    const completedTrips = trips.filter(t => t.status === "completed").length;
+
+    // Today's passengers (from attendance)
+    let attQuery = admin.firestore().collection("attendance").where("date", "==", today);
+    if (inst && inst !== "all") {
+      const students = studentCache.filter(s => s.institution === inst);
+      const ids = new Set(students.map(s => s.studentId));
+      const attSnap = await attQuery.get();
+      const totalPassengers = attSnap.docs.filter(d => d.data().boarded && ids.has(d.data().studentId)).length;
+      const statsResp = { success: true, totalTrips, totalDistance, totalPassengers, runningBuses, completedTrips };
+      if (redisReady) redis.setEx(statsCacheKey, 30, statsResp).catch(() => {});
+      return res.json(statsResp);
+    }
+
+    const attSnap = await attQuery.get();
+    const totalPassengers = attSnap.docs.filter(d => d.data().boarded).length;
+
+    const statsResp2 = { success: true, totalTrips, totalDistance, totalPassengers, runningBuses, completedTrips };
+    if (redisReady) redis.setEx(statsCacheKey, 30, statsResp2).catch(() => {});
+    return res.json(statsResp2);
+  } catch (e) {
+    console.error("[REPORTS/STATS] Error:", e.message);
+    return res.status(500).json({ error: "Failed to fetch dashboard stats" });
+  }
+});
+
 // ── Graceful Shutdown ───────────────────────────────────────────────────────
 let isShuttingDown = false;
 function gracefulShutdown(signal) {
@@ -6806,4 +7337,5 @@ process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 const server = app.listen(3000, () => {
   console.log(JSON.stringify({ ts: new Date().toISOString(), level: "INFO", event: "startup", port: 3000, node: process.version, pid: process.pid }));
   preWarmRouteCache().catch((e) => console.log("Route pre-warm error:", e.message));
+  _rebuildTodayTripsCache().catch((e) => console.log("Trip cache rebuild error:", e.message));
 });
