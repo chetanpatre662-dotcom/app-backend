@@ -339,6 +339,21 @@ const ticketLimiter = rateLimit({
 });
 app.use(apiLimiter);
 
+// ── /api prefix rewrite — handle both Nginx-stripped and non-stripped requests ──
+// Some reverse proxy configs strip /api before forwarding, others don't.
+// This middleware ensures routes work either way by stripping /api when the
+// remaining path would match a non-/api route (admin routes, complaint, etc.)
+// Routes defined WITH /api/ prefix (/api/tickets, /api/bus-pass, etc.) take priority
+// because Express matches them BEFORE this middleware's rewrite takes effect on next().
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/") && !req.path.startsWith("/api/tickets") && 
+      !req.path.startsWith("/api/bus-pass") && !req.path.startsWith("/api/notifications") &&
+      !req.path.startsWith("/api/tracking")) {
+    req.url = req.url.replace(/^\/api/, "");
+  }
+  next();
+});
+
 function isAtCollege(lat, lng) {
   const dist = calculateDistance(lat, lng, COLLEGE_LAT, COLLEGE_LNG);
 
