@@ -2873,8 +2873,9 @@ async function handleBus(bus, students) {
 
   // ── AUTOMATIC TRIP LOGGING ─────────────────────────────────────────────────
   // Creates trip_log entries in Firestore when bus starts/stops moving.
-  // Uses debounce: bus must be stopped for 3 consecutive poll cycles (~30s)
-  // to confirm trip end. This prevents GPS flicker from creating false trips.
+  // Trip END condition: bus remains at the SAME LOCATION (within 20m GPS
+  // tolerance) continuously for 5 minutes. Temporary stops (student pickup,
+  // traffic, signals) do NOT end a trip.
   
   if (!tripStatusMap[busId]) {
     // Initialize trip tracking state for this bus
@@ -2882,8 +2883,10 @@ async function handleBus(bus, students) {
       currentTripId: null,
       tripStartTime: null,
       tripStartKm: 0,
-      stoppedCycles: 0,       // Consecutive cycles with tripActive=false
-      STOP_DEBOUNCE: 3,       // Required consecutive stopped cycles to end trip
+      // Location-based idle detection (replaces simple cycle counter)
+      idleStartTime: null,       // When the bus first stopped at this position
+      idleLat: null,             // Position where the bus became idle
+      idleLng: null,
     };
     // Restore from Redis on cold start
     const savedTrip = await redis.get(`tripState:${busId}`);
@@ -2894,9 +2897,19 @@ async function handleBus(bus, students) {
 
   const tripState = tripStatusMap[busId];
 
-  // Trip START: tripActive transitions to true and no active trip
-  if (bus.tripActive && !tripState.currentTripId) {
-    tripState.stoppedCycles = 0;
+  // ── Configuration ──────────────────────────────────────────────────────────
+  const TRIP_START_SPEED    = 10;   // km/h — speed to start a new trip
+  const TRIP_MOVING_SPEED   = 3;    // km/h — above this = bus is moving (not idle)
+  const IDLE_TOLERANCE_KM   = 0.02; // 20 meters — GPS drift tolerance
+  const IDLE_TIMEOUT_MS     = 5 * 60 * 1000; // 5 minutes to confirm trip end
+
+  const busIsMoving = bus.speed > TRIP_MOVING_SPEED;
+
+  // Trip START: speed exceeds threshold and no active trip
+  if (bus.speed > TRIP_START_SPEED && !tripState.currentTripId) {
+    tripState.idleStartTime = null;
+    tripState.idleLat = null;
+    tripState.idleLng = null;
     const tripId = `${busId}_${today}_${Date.now()}`;
     const startIst = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit" });
     
@@ -2934,64 +2947,94 @@ async function handleBus(bus, students) {
     });
   }
 
-  // Trip CONTINUE: reset stopped counter when bus is moving
-  if (bus.tripActive && tripState.currentTripId) {
-    tripState.stoppedCycles = 0;
+  // Trip CONTINUE: bus is moving → reset idle tracking
+  if (busIsMoving && tripState.currentTripId) {
+    if (tripState.idleStartTime) {
+      // Bus was idle but started moving again before 5 min → continue trip
+      console.log(`🚌 TRIP CONTINUE | ${busId} | resumed after ${Math.round((Date.now() - tripState.idleStartTime) / 1000)}s idle`);
+      tripState.idleStartTime = null;
+      tripState.idleLat = null;
+      tripState.idleLng = null;
+      await redis.setEx(`tripState:${busId}`, 86400, tripState);
+    }
   }
 
-  // Trip STOP detection: count consecutive stopped cycles
-  if (!bus.tripActive && tripState.currentTripId) {
-    tripState.stoppedCycles++;
-
-    // Only end trip after sustained stop (debounce)
-    if (tripState.stoppedCycles >= tripState.STOP_DEBOUNCE) {
-      const endIst = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit" });
-      const durationMs = Date.now() - new Date(tripState.tripStartTime).getTime();
-      const durationMin = Math.round(durationMs / 60000);
-      const distanceKm = ((busDistanceTracker[busId]?.totalKm || 0) - tripState.tripStartKm).toFixed(1);
-
-      // Count passengers boarded during this trip (from today's attendance)
-      const attSnap = await admin.firestore().collection("attendance")
-        .where("busId", "==", busId)
-        .where("date", "==", today)
-        .where("boarded", "==", true)
-        .get().catch(() => ({ docs: [] }));
-      const passengerCount = attSnap.docs ? attSnap.docs.length : 0;
-
-      // Update Firestore trip_log (merge: true creates doc if initial write failed)
-      admin.firestore().collection("trip_logs").doc(tripState.currentTripId).set({
-        tripId: tripState.currentTripId,
-        busId,
-        date: today,
-        institution: bus.routeType || "college",
-        endTime: endIst,
-        endTimeISO: new Date().toISOString(),
-        distance: parseFloat(distanceKm),
-        duration: durationMin,
-        passengerCount,
-        status: "completed",
-      }, { merge: true }).catch(e => console.log(`[TRIP] Error ending trip: ${e.message}`));
-
-      console.log(`🚌 TRIP ENDED | ${busId} | duration=${durationMin}min distance=${distanceKm}km passengers=${passengerCount}`);
-
-      // Update in-memory trip cache (instant)
-      const cachedTrip = _todayTripsCache.trips.find(t => t.tripId === tripState.currentTripId);
-      if (cachedTrip) {
-        cachedTrip.endTime = endIst;
-        cachedTrip.distance = parseFloat(distanceKm);
-        cachedTrip.duration = durationMin;
-        cachedTrip.passengerCount = passengerCount;
-        cachedTrip.status = "completed";
-      }
-
-      // Reset trip state
-      tripState.currentTripId = null;
-      tripState.tripStartTime = null;
-      tripState.tripStartKm = 0;
-      tripState.stoppedCycles = 0;
-
-      // Persist reset to Redis
+  // Trip IDLE detection: bus stopped with an active trip
+  if (!busIsMoving && tripState.currentTripId) {
+    if (!tripState.idleStartTime) {
+      // First idle cycle — record position and start timer
+      tripState.idleStartTime = Date.now();
+      tripState.idleLat = bus.lat;
+      tripState.idleLng = bus.lng;
       await redis.setEx(`tripState:${busId}`, 86400, tripState);
+    } else {
+      // Already idle — check if bus drifted away from idle position
+      const driftKm = calculateDistance(tripState.idleLat, tripState.idleLng, bus.lat, bus.lng);
+      
+      if (driftKm > IDLE_TOLERANCE_KM) {
+        // Bus moved more than 20m from idle position — it's actually moving
+        // (slow crawl in traffic, inching forward at pickup). Reset idle timer.
+        tripState.idleStartTime = Date.now();
+        tripState.idleLat = bus.lat;
+        tripState.idleLng = bus.lng;
+        await redis.setEx(`tripState:${busId}`, 86400, tripState);
+      } else {
+        // Still at same location — check if 5 minutes elapsed
+        const idleDurationMs = Date.now() - tripState.idleStartTime;
+        
+        if (idleDurationMs >= IDLE_TIMEOUT_MS) {
+          // ═══════════ TRIP END ═══════════
+          const endIst = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true, hour: "2-digit", minute: "2-digit" });
+          const durationMs = Date.now() - new Date(tripState.tripStartTime).getTime();
+          const durationMin = Math.round(durationMs / 60000);
+          const distanceKm = ((busDistanceTracker[busId]?.totalKm || 0) - tripState.tripStartKm).toFixed(1);
+
+          // Count passengers boarded during this trip (from today's attendance)
+          const attSnap = await admin.firestore().collection("attendance")
+            .where("busId", "==", busId)
+            .where("date", "==", today)
+            .where("boarded", "==", true)
+            .get().catch(() => ({ docs: [] }));
+          const passengerCount = attSnap.docs ? attSnap.docs.length : 0;
+
+          // Update Firestore trip_log
+          admin.firestore().collection("trip_logs").doc(tripState.currentTripId).set({
+            tripId: tripState.currentTripId,
+            busId,
+            date: today,
+            institution: bus.routeType || "college",
+            endTime: endIst,
+            endTimeISO: new Date().toISOString(),
+            distance: parseFloat(distanceKm),
+            duration: durationMin,
+            passengerCount,
+            status: "completed",
+          }, { merge: true }).catch(e => console.log(`[TRIP] Error ending trip: ${e.message}`));
+
+          console.log(`🚌 TRIP ENDED | ${busId} | duration=${durationMin}min distance=${distanceKm}km passengers=${passengerCount} idle=${Math.round(idleDurationMs/1000)}s`);
+
+          // Update in-memory trip cache
+          const cachedTrip = _todayTripsCache.trips.find(t => t.tripId === tripState.currentTripId);
+          if (cachedTrip) {
+            cachedTrip.endTime = endIst;
+            cachedTrip.distance = parseFloat(distanceKm);
+            cachedTrip.duration = durationMin;
+            cachedTrip.passengerCount = passengerCount;
+            cachedTrip.status = "completed";
+          }
+
+          // Reset trip state
+          tripState.currentTripId = null;
+          tripState.tripStartTime = null;
+          tripState.tripStartKm = 0;
+          tripState.idleStartTime = null;
+          tripState.idleLat = null;
+          tripState.idleLng = null;
+
+          // Persist reset to Redis
+          await redis.setEx(`tripState:${busId}`, 86400, tripState);
+        }
+      }
     }
   }
 
