@@ -375,6 +375,9 @@ async function handleAttendance(bus, students) {
 
   if (busStudents.length === 0) return;
 
+  // [DIAG] Log attendance processing entry
+  console.log(`[ATT-DIAG] ${bus.busId} speed=${bus.speed} students=${busStudents.length} bus_at_college=${isAtCollege(bus.lat, bus.lng)}`);
+
   const today = new Date().toISOString().split("T")[0];
   const now   = Date.now();
 
@@ -434,7 +437,10 @@ async function handleAttendance(bus, students) {
     if (!att.boarded) {
       // Skip boarding check if student GPS is extremely stale (>10 min)
       // This prevents boarding marks from yesterday's cached location.
-      if (locAge > 10 * 60 * 1000) continue;
+      if (locAge > 10 * 60 * 1000) {
+        console.log(`[ATT-DIAG] ${bus.busId} → ${student.studentId} SKIP_BOARDING: stale GPS (${Math.round(locAge/1000)}s old)`);
+        continue;
+      }
 
       if (distance <= BOARDING_RADIUS_KM && bus.speed > 5) {
         // Increment consecutive-proximity counter
@@ -1714,9 +1720,10 @@ app.post("/student-location", authenticateFirebaseUser, async (req, res) => {
     const currentMinutes = indiaTime.getHours() * 60 + indiaTime.getMinutes();
 
     const startMinutes = 6 * 60;      // 6:00 AM
-    const endMinutes   = 12 * 60;     // 12:00 PM
+    const endMinutes   = 20 * 60;     // 8:00 PM (covers morning + afternoon routes)
 
     if (currentMinutes < startMinutes || currentMinutes > endMinutes) {
+      console.log(`[LOC-DIAG] REJECTED: time=${indiaTime.toLocaleTimeString("en-IN")} outside ${startMinutes/60}:00-${endMinutes/60}:00 window`);
       return res.json({
         success: false,
         message: "Tracking time closed",
@@ -3058,6 +3065,11 @@ async function handleBus(bus, students) {
       return storedBus === liveBus;
     });
 
+    // [DIAG] Log entry into notification block (once per bus per loop)
+    if (busUsers.length > 0) {
+      console.log(`[NOTIF-DIAG] ${busId} speed=${bus.speed} eligible_users=${busUsers.length} ids=[${busUsers.slice(0,3).map(u=>u.studentId).join(",")}]`);
+    }
+
     if (busUsers.length > 0) {
       // ── BATCH: Pre-fetch all student locations concurrently ──────────────
       const userLocs = await Promise.all(
@@ -3069,7 +3081,14 @@ async function handleBus(bus, students) {
         if (!user.fcmToken || !user.studentId) continue;
 
         const loc = userLocs[i];
-        if (!loc?.lat || !loc?.lng) continue;
+        if (!loc?.lat || !loc?.lng) {
+          console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} SKIP: no Redis location`);
+          continue;
+        }
+
+      // [DIAG] Log staleness of student location
+      const locAgeMs = loc.lastUpdated ? (Date.now() - loc.lastUpdated) : -1;
+      console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} loc_age=${Math.round(locAgeMs/1000)}s lat=${loc.lat?.toFixed(4)} lng=${loc.lng?.toFixed(4)}`);
 
       if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng) ||
           !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng)) continue;
@@ -3079,21 +3098,23 @@ async function handleBus(bus, students) {
 
       const nearbyKey = `notif:nearby:${user.studentId}:${busId}:${today}`;
 
+      console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} dist=${dist.toFixed(2)}km key=${nearbyKey}`);
+
       if (dist > 8) {
         // Bus moved away — delete dedup flag so it can fire again next approach.
-        // redis.del is a no-op when the key doesn't exist, so no extra exists() check.
         await redis.del(nearbyKey);
         continue;
       }
 
       if (dist <= 5 && dist > 0.1) {
         const alreadySent = await redis.get(nearbyKey);
+        console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} IN_RANGE dist=${dist.toFixed(2)}km alreadySent=${!!alreadySent}`);
         if (!alreadySent) {
           // Set BEFORE sending to prevent race-condition duplicates
           await redis.setEx(nearbyKey, 4 * 3600, "1"); // TTL 4h resets daily
 
           try {
-            await admin.messaging().send({
+            const fcmResult = await admin.messaging().send({
               token: user.fcmToken,
               notification: {
                 title: "🚌 Bus is Nearby!",
@@ -3107,17 +3128,23 @@ async function handleBus(bus, students) {
               },
               android: { priority: "high", notification: { channelId: "bus_channel" } },
             });
-            console.log(`✅ Nearby → ${user.studentId} (${dist.toFixed(1)} km)`);
+            console.log(`✅ Nearby → ${user.studentId} (${dist.toFixed(1)} km) FCM_ID=${fcmResult}`);
           } catch (e) {
             if (e.code === "messaging/registration-token-not-registered" || e.code === "messaging/invalid-registration-token") {
               _pruneInvalidToken(user.fcmToken, user.studentId, "students");
             }
-            console.log(`❌ FCM nearby skip (${user.studentId}): ${e.message}`);
+            console.log(`❌ FCM nearby FAILED (${user.studentId}): code=${e.code} msg=${e.message}`);
           }
         }
       }
     }
     } // close if (busUsers.length > 0)
+  } else {
+    // [DIAG] Bus speed too low to enter notification block
+    if (bus.speed > 0) {
+      // Only log once when speed is between 1-4 (avoid spam for parked buses)
+      // Actually skip this to avoid log spam — only log when speed >= 5 above
+    }
   }
 }
 /* =========================
