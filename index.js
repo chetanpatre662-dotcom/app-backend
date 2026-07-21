@@ -421,18 +421,19 @@ async function handleAttendance(bus, students) {
     // =========================
     // BOARDING
     // =========================
-    // Multi-update confirmation: student must be within 0.05 km of the moving
-    // bus for BOARDING_CONFIRM_COUNT consecutive loop ticks before boarding
-    // is marked. This prevents a student standing near the road from getting
-    // a false boarding mark from a single GPS proximity coincidence.
+    // Multi-update confirmation: student must be within BOARDING_RADIUS_KM of
+    // the moving bus for BOARDING_CONFIRM_COUNT consecutive loop ticks before
+    // boarding is marked. This prevents false positives from students who live
+    // near the route but aren't actually on the bus.
     //
-    // Note: Boarding uses bus GPS proximity (bus moving past student).
-    // Stale student GPS still allows boarding detection because the bus GPS
-    // is always fresh (from the tracking device). The student just needs to
-    // be physically near the bus — their last-known position is sufficient
-    // for the 90m radius check within a short staleness window.
-    const BOARDING_CONFIRM_COUNT = 5;   // ~45 s at 15 s/tick
-    const BOARDING_RADIUS_KM     = 0.09; // 90 m
+    // 300m radius accounts for:
+    //   - GPS inaccuracy (5-30m on mobile)
+    //   - Bus stops offset from the road
+    //   - Students standing at pickup points across the road
+    // Combined with 3-tick confirmation (~45s), this ensures the bus actually
+    // passed by (not just a single coincidental proximity reading).
+    const BOARDING_CONFIRM_COUNT = 3;    // ~45 s at 15 s/tick
+    const BOARDING_RADIUS_KM     = 0.3;  // 300 m
 
     if (!att.boarded) {
       // Skip boarding check if student GPS is extremely stale (>10 min)
@@ -710,18 +711,12 @@ const SML_API = {
 const busMap = {
  "866477065754528": "BUS-2",
   "866477065667928": "BUS-3",
-  "868329089743334": "BUS-4",
-  "868329089729648": "BUS-5",
-  "868329089734846": "BUS-6",
-  "860560065510150": "BUS-7",
-  "860560068751223": "BUS-8",
-  "868329087892307": "BUS-9",
   "860560064978408": "BUS-10",
+  "860560065510150": "BUS-7",
+  "868329087892307": "BUS-9",
   "860560067136350": "BUS-11",
-  "867994069565790": "BUS-12",
-  "868613060251288": "BUS-13",
-  "862567077140767": "BUS-14",
   "866334078434509": "BUS-15",
+  "862567077140767": "BUS-14",
 };
 
 const driverMap = {
