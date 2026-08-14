@@ -711,9 +711,6 @@ const SML_API = {
 const busMap = {
  "866477065754528": "BUS-2",
   "866477065667928": "BUS-3",
-  "868329089743334": "BUS-4",
-  "868329089729648": "BUS-5",
-  "868329089734846": "BUS-6",
   "860560064978408": "BUS-10",
   "860560065510150": "BUS-7",
   "868329087892307": "BUS-9",
@@ -815,8 +812,6 @@ async function updateBusGpsHistory(busId, lat, lng) {
 
   hist.unshift({ lat, lng, ts: Date.now() });
   if (hist.length > GPS_HISTORY_SIZE) hist.pop();
-
-
 
   // Persist to Redis asynchronously — don't block the hot path
   redis.setEx(`${REDIS_GPS_PREFIX}${busId}`, GPS_TTL_SEC, hist).catch(() => {});
