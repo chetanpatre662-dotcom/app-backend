@@ -534,23 +534,20 @@ async function handleAttendance(bus, students) {
       }
     }
     // =========================
-    // EXIT DETECTION
-    // Student boarded but is now far from the bus and the bus is NOT at
-    // college → they exited the bus mid-route.
+    // EXIT DETECTION — DISABLED
+    // Automatic exit detection has been disabled because the GPS-distance
+    // heuristic (student > 0.5 km from bus) produces false positives when:
+    //   • Student phone GPS drifts while inside the bus
+    //   • Student GPS fix is slightly delayed but not stale-flagged
+    //   • Bus GPS and student GPS report at different moments
+    //   • Reception is poor (tunnels, rural areas)
     //
-    // Conditions (all must be true):
-    //   1. att.boarded == true      (was confirmed as boarded today)
-    //   2. att.exited != true       (not already recorded as exited)
-    //   3. !isAtCollege(bus)        (bus hasn't reached college yet)
-    //   4. distance > EXIT_RADIUS_KM (student is far from the bus)
-    //   5. bus.speed > 5            (bus is still moving, not just stopped)
-    //
-    // A 3-tick confirmation is used to avoid transient GPS drift marking a
-    // genuine passenger as exited due to a momentary bad GPS fix.
-    //
-    // Stale GPS: If student GPS is stale, do NOT mark as exited — the student
-    // may still be on the bus but their phone stopped uploading GPS.
+    // Boarding and College Arrival remain fully functional.
+    // EXIT can still be set manually via admin panel if needed.
+    // To re-enable in future, uncomment the block below and consider
+    // increasing EXIT_RADIUS_KM and EXIT_CONFIRM_COUNT significantly.
     // =========================
+    /*
     const EXIT_RADIUS_KM   = 0.5;   // 300 m — clearly off the bus
     const EXIT_CONFIRM_COUNT = 3;   // ~45 s at 15 s/tick
 
@@ -608,6 +605,7 @@ async function handleAttendance(bus, students) {
         console.log("🚪 Exited mid-route", student.studentId);
       }
     }
+    */
 
     // =========================
     // ARRIVAL
@@ -709,11 +707,11 @@ const SML_API = {
    BUS MAP
 ========================= */
 const busMap = {
- "866477065754528": "BUS-2",
-  "866477065667928": "BUS-3",
+  "868329089743334": "BUS-4",
+  "868329089729648": "BUS-5",
+  "868329089734846": "BUS-6",
   "860560064978408": "BUS-10",
   "860560065510150": "BUS-7",
-  "868329087892307": "BUS-9",
   "860560067136350": "BUS-11",
   "866334078434509": "BUS-15",
   "862567077140767": "BUS-14",
@@ -812,6 +810,8 @@ async function updateBusGpsHistory(busId, lat, lng) {
 
   hist.unshift({ lat, lng, ts: Date.now() });
   if (hist.length > GPS_HISTORY_SIZE) hist.pop();
+
+
 
   // Persist to Redis asynchronously — don't block the hot path
   redis.setEx(`${REDIS_GPS_PREFIX}${busId}`, GPS_TTL_SEC, hist).catch(() => {});
@@ -2759,22 +2759,33 @@ async function trackBusDistance(bus) {
     }
 
     // ── Calculate distance between consecutive GPS points ─────────────────
-    const distance = calculateDistance(
+    const haversineKm = calculateDistance(
       tracker.lastLat,
       tracker.lastLng,
       bus.lat,
       bus.lng,
     );
 
-    // ── Speed-based validation ───────────────────────────────────────────
-    // Instead of a fixed distance threshold (which discards valid highway
-    // movement), validate using implied speed between the two points.
-    // Accept: implied speed ≤ 120 km/h (reasonable for a bus)
-    // Reject: implied speed > 120 km/h (GPS teleport / noise)
-    // Also reject: distance < 0.005 km (5 meters — GPS jitter when stopped)
+    // ── Speed-based distance (accounts for road curvature) ───────────────
+    // GPS trackers report speed via Doppler which follows the actual road
+    // path, unlike Haversine chord distance which undercounts on curves.
+    // Use the GREATER of haversine and speed-based distance to avoid
+    // the systematic undercounting caused by chord-vs-arc at 10-15s intervals.
     const now = Date.now();
     const elapsedSec = (now - (tracker.lastTime || now)) / 1000;
-    const impliedSpeedKmh = elapsedSec > 0 ? (distance / elapsedSec) * 3600 : 0;
+    const reportedSpeedKmh = bus.speed || 0;
+    const speedBasedKm = (reportedSpeedKmh / 3600) * elapsedSec;
+
+    // Use the better estimate: max(haversine, speed×time)
+    // Haversine is a lower bound (chord); speed×time follows the arc.
+    // Cap speed-based at 1.35× haversine to prevent gross overcount from
+    // a momentary high speed reading while actually stationary (GPS noise).
+    const cappedSpeedKm = Math.min(speedBasedKm, haversineKm * 1.35);
+    const distance = Math.max(haversineKm, cappedSpeedKm);
+
+    // ── Validation ───────────────────────────────────────────────────────
+    // Implied speed from haversine (for teleport detection)
+    const impliedSpeedKmh = elapsedSec > 0 ? (haversineKm / elapsedSec) * 3600 : 0;
 
     const MIN_DISTANCE_KM = 0.005;  // 5 meters — ignore GPS jitter
     const MAX_SPEED_KMH   = 120;    // max plausible bus speed
@@ -2786,7 +2797,7 @@ async function trackBusDistance(bus) {
       tracker.lastLat  = bus.lat;
       tracker.lastLng  = bus.lng;
       tracker.lastTime = now;
-    } else if (distance < MIN_DISTANCE_KM) {
+    } else if (haversineKm < MIN_DISTANCE_KM) {
       // GPS jitter (< 5m) — update reference point but don't count distance
       tracker.lastLat  = bus.lat;
       tracker.lastLng  = bus.lng;
