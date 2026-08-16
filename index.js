@@ -3756,7 +3756,7 @@ app.get("/admin/attendance-month", adminAuth, async (req, res) => {
 app.put("/admin/bus/:busId", adminAuth, async (req, res) => {
   try {
     const { busId } = req.params;
-    const { driverName, driverMobile, route } = req.body;
+    const { driverName, driverMobile, route, rtoNumber } = req.body;
 
     if (!busId) {
       return res.status(400).json({ success: false, error: "busId required" });
@@ -3766,6 +3766,7 @@ app.put("/admin/bus/:busId", adminAuth, async (req, res) => {
     if (driverName  !== undefined) update.driverName   = driverName;
     if (driverMobile !== undefined) update.driverMobile = driverMobile;
     if (route        !== undefined) update.route        = route;
+    if (rtoNumber    !== undefined) update.rtoNumber    = rtoNumber;
 
     if (!Object.keys(update).length) {
       return res.status(400).json({ success: false, error: "No fields to update" });
@@ -3778,9 +3779,53 @@ app.put("/admin/bus/:busId", adminAuth, async (req, res) => {
       .doc(busId)
       .set(update, { merge: true });
 
+    // Also update the unified RTO mapping document
+    if (rtoNumber !== undefined) {
+      await admin.firestore().collection("settings").doc("rtoMapping").set(
+        { [busId]: rtoNumber || "" },
+        { merge: true }
+      );
+    }
+
     return res.json({ success: true, busId, updated: update });
   } catch (e) {
     console.log("BUS UPDATE ERROR:", e);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// GET /admin/rto-mapping — Get unified RTO number mapping for all buses
+app.get("/admin/rto-mapping", adminAuth, async (req, res) => {
+  try {
+    const doc = await admin.firestore().collection("settings").doc("rtoMapping").get();
+    const mapping = doc.exists ? doc.data() : {};
+    return res.json({ success: true, mapping });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// PUT /admin/rto-mapping — Update RTO number mapping (bulk or single)
+app.put("/admin/rto-mapping", adminAuth, async (req, res) => {
+  try {
+    const { mapping } = req.body;
+    if (!mapping || typeof mapping !== "object") {
+      return res.status(400).json({ success: false, error: "mapping object required" });
+    }
+    await admin.firestore().collection("settings").doc("rtoMapping").set(mapping, { merge: true });
+    return res.json({ success: true, message: "RTO mapping updated" });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// GET /api/rto-mapping — Public (authenticated) endpoint for Flutter app to fetch RTO mapping
+app.get("/api/rto-mapping", async (req, res) => {
+  try {
+    const doc = await admin.firestore().collection("settings").doc("rtoMapping").get();
+    const mapping = doc.exists ? doc.data() : {};
+    return res.json({ success: true, mapping });
+  } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
   }
 });
