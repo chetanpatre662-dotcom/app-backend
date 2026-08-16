@@ -6473,7 +6473,11 @@ function busPassAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: "No token provided" });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    if (!decoded.buspass && decoded.role !== "bus_pass_admin") throw new Error();
+    // Allow: bus_pass_admin, college admin, superadmin
+    const isBusPassAdmin = decoded.buspass || decoded.role === "bus_pass_admin";
+    const isCollegeAdmin = decoded.admin && decoded.institution === "college" && decoded.role === "admin";
+    const isSuperAdmin = decoded.admin && decoded.role === "superadmin";
+    if (!isBusPassAdmin && !isCollegeAdmin && !isSuperAdmin) throw new Error();
     req.buspassOperator = decoded.operator || decoded.role || "admin";
     next();
   } catch (e) {
