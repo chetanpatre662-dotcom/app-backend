@@ -5905,8 +5905,41 @@ app.post("/admin/login", loginLimiter, async (req, res) => {
 
     // Bus Pass Admin
     if (username === process.env.BUSPASS_USERNAME && await bcrypt.compare(password, process.env.BUSPASS_PASS_HASH)) {
+      // Check account verification status in Firestore
+      const verDoc = await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get();
+      const verData = verDoc.exists ? verDoc.data() : {};
+      const verificationStatus = verData.verificationStatus || "pending";
+
+      if (verificationStatus === "revoked") {
+        return res.status(403).json({ success: false, error: "Account has been revoked. Contact College Administration.", requiresVerification: true, status: "revoked" });
+      }
+
+      if (verificationStatus !== "verified") {
+        // Account not yet verified — create a verification request
+        const requestId = "VR-" + Date.now().toString(36).toUpperCase() + "-" + Math.random().toString(36).substring(2, 6).toUpperCase();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+        await admin.firestore().collection("buspass_login_requests").doc(requestId).set({
+          accountId: "buspass_primary",
+          username: username,
+          status: "PENDING",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          expiresAt: expiresAt.toISOString(),
+          approvedAt: null,
+          approvedBy: null,
+        });
+        return res.status(403).json({
+          success: false,
+          requiresVerification: true,
+          status: "pending",
+          requestId: requestId,
+          message: "Your credentials are correct. College Administration must verify your account before you can access Bus Pass.",
+          expiresAt: expiresAt.toISOString(),
+        });
+      }
+
+      // Account is verified — issue token
       const token = jwt.sign(
-        { admin: true, buspass: true, role: "bus_pass_admin", institution: "college" },
+        { admin: true, buspass: true, role: "bus_pass_admin", institution: "college", verified: true },
         process.env.JWT_SECRET,
         { expiresIn: "24h" }
       );
@@ -6473,13 +6506,29 @@ function busPassAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: "No token provided" });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    // Allow: bus_pass_admin, college admin, superadmin
+    // Allow: bus_pass_admin (verified), college admin, superadmin
     const isBusPassAdmin = decoded.buspass || decoded.role === "bus_pass_admin";
     const isCollegeAdmin = decoded.admin && decoded.institution === "college" && decoded.role === "admin";
     const isSuperAdmin = decoded.admin && decoded.role === "superadmin";
     if (!isBusPassAdmin && !isCollegeAdmin && !isSuperAdmin) throw new Error();
     req.buspassOperator = decoded.operator || decoded.role || "admin";
-    next();
+    // For bus_pass_admin tokens, verify account hasn't been revoked since token was issued
+    if (isBusPassAdmin && !isCollegeAdmin && !isSuperAdmin) {
+      return admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get()
+        .then(doc => {
+          const data = doc.exists ? doc.data() : {};
+          if (data.verificationStatus === "revoked") {
+            return res.status(403).json({ error: "Account has been revoked. Contact College Administration." });
+          }
+          if (data.verificationStatus !== "verified") {
+            return res.status(403).json({ error: "Account not verified. Contact College Administration." });
+          }
+          next();
+        })
+        .catch(() => next()); // If Firestore fails, allow (fail-open for existing verified tokens)
+    } else {
+      next();
+    }
   } catch (e) {
     return res.status(401).json({ error: "Invalid or expired token" });
   }
@@ -6679,6 +6728,185 @@ cron.schedule("0 8 * * *", async () => {
     if (reminded > 0) console.log(`[CRON] Sent ${reminded} expiry reminders`);
   } catch (e) {
     console.log("[CRON] Expiry check error:", e.message);
+  }
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+   BUS PASS ADMIN — Account Verification System
+   College Admin can approve/reject/revoke bus pass admin account access
+═══════════════════════════════════════════════════════════════════════════════ */
+
+// GET /api/bus-pass/admin-verification/requests — List pending/all verification requests (College Admin only)
+app.get("/api/bus-pass/admin-verification/requests", adminAuth, async (req, res) => {
+  try {
+    // Only college admin or superadmin can manage verification requests
+    if (req.adminRole !== "superadmin" && req.adminInstitution !== "college") {
+      return res.status(403).json({ success: false, error: "College Admin access required" });
+    }
+
+    const snap = await admin.firestore().collection("buspass_login_requests")
+      .orderBy("createdAt", "desc")
+      .limit(50)
+      .get();
+
+    const now = new Date();
+    const requests = snap.docs.map(d => {
+      const data = d.data();
+      let status = data.status;
+      // Mark expired requests
+      if (status === "PENDING" && data.expiresAt && new Date(data.expiresAt) < now) {
+        status = "EXPIRED";
+      }
+      return {
+        id: d.id,
+        accountId: data.accountId || "",
+        username: data.username || "",
+        status,
+        createdAt: data.createdAt,
+        expiresAt: data.expiresAt || null,
+        approvedAt: data.approvedAt || null,
+        approvedBy: data.approvedBy || null,
+        rejectedAt: data.rejectedAt || null,
+        rejectedBy: data.rejectedBy || null,
+      };
+    });
+
+    // Get account verification status
+    const accDoc = await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get();
+    const accountStatus = accDoc.exists ? (accDoc.data().verificationStatus || "pending") : "pending";
+
+    return res.json({ success: true, requests, accountStatus });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/bus-pass/admin-verification/approve/:requestId — Approve a verification request
+app.post("/api/bus-pass/admin-verification/approve/:requestId", adminAuth, async (req, res) => {
+  try {
+    if (req.adminRole !== "superadmin" && req.adminInstitution !== "college") {
+      return res.status(403).json({ success: false, error: "College Admin access required" });
+    }
+
+    const { requestId } = req.params;
+    const reqDoc = await admin.firestore().collection("buspass_login_requests").doc(requestId).get();
+    if (!reqDoc.exists) return res.status(404).json({ success: false, error: "Request not found" });
+
+    const reqData = reqDoc.data();
+
+    // Check if request is still valid
+    if (reqData.status !== "PENDING") {
+      return res.status(400).json({ success: false, error: `Request already ${reqData.status}` });
+    }
+    if (reqData.expiresAt && new Date(reqData.expiresAt) < new Date()) {
+      await reqDoc.ref.update({ status: "EXPIRED" });
+      return res.status(400).json({ success: false, error: "Request has expired" });
+    }
+
+    // Approve the request
+    await reqDoc.ref.update({
+      status: "APPROVED",
+      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      approvedBy: req.adminRole || "college_admin",
+    });
+
+    // Permanently verify the bus pass admin account
+    await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").set({
+      verificationStatus: "verified",
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+      verifiedBy: req.adminRole || "college_admin",
+      lastApprovedRequestId: requestId,
+    }, { merge: true });
+
+    return res.json({ success: true, message: "Bus Pass Admin account verified successfully" });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/bus-pass/admin-verification/reject/:requestId — Reject a verification request
+app.post("/api/bus-pass/admin-verification/reject/:requestId", adminAuth, async (req, res) => {
+  try {
+    if (req.adminRole !== "superadmin" && req.adminInstitution !== "college") {
+      return res.status(403).json({ success: false, error: "College Admin access required" });
+    }
+
+    const { requestId } = req.params;
+    const reqDoc = await admin.firestore().collection("buspass_login_requests").doc(requestId).get();
+    if (!reqDoc.exists) return res.status(404).json({ success: false, error: "Request not found" });
+
+    const reqData = reqDoc.data();
+    if (reqData.status !== "PENDING") {
+      return res.status(400).json({ success: false, error: `Request already ${reqData.status}` });
+    }
+
+    await reqDoc.ref.update({
+      status: "REJECTED",
+      rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      rejectedBy: req.adminRole || "college_admin",
+    });
+
+    return res.json({ success: true, message: "Request rejected" });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/bus-pass/admin-verification/revoke — Revoke a verified bus pass admin account
+app.post("/api/bus-pass/admin-verification/revoke", adminAuth, async (req, res) => {
+  try {
+    if (req.adminRole !== "superadmin" && req.adminInstitution !== "college") {
+      return res.status(403).json({ success: false, error: "College Admin access required" });
+    }
+
+    await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").set({
+      verificationStatus: "revoked",
+      revokedAt: admin.firestore.FieldValue.serverTimestamp(),
+      revokedBy: req.adminRole || "college_admin",
+    }, { merge: true });
+
+    return res.json({ success: true, message: "Bus Pass Admin account verification revoked" });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// GET /api/bus-pass/admin-verification/status — Check bus pass admin account verification status (used by login page for polling)
+app.get("/api/bus-pass/admin-verification/status/:requestId", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const reqDoc = await admin.firestore().collection("buspass_login_requests").doc(requestId).get();
+    if (!reqDoc.exists) return res.status(404).json({ success: false, error: "Request not found" });
+
+    const reqData = reqDoc.data();
+    let status = reqData.status;
+
+    // Check expiry
+    if (status === "PENDING" && reqData.expiresAt && new Date(reqData.expiresAt) < new Date()) {
+      status = "EXPIRED";
+      await reqDoc.ref.update({ status: "EXPIRED" });
+    }
+
+    // If approved, also return a fresh token
+    if (status === "APPROVED") {
+      // Verify account is still verified
+      const accDoc = await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get();
+      const accData = accDoc.exists ? accDoc.data() : {};
+      if (accData.verificationStatus === "verified") {
+        const token = jwt.sign(
+          { admin: true, buspass: true, role: "bus_pass_admin", institution: "college", verified: true },
+          process.env.JWT_SECRET,
+          { expiresIn: "24h" }
+        );
+        // Mark request as consumed
+        await reqDoc.ref.update({ status: "CONSUMED" });
+        return res.json({ success: true, status: "APPROVED", token, institution: "buspass", role: "bus_pass_admin" });
+      }
+    }
+
+    return res.json({ success: true, status });
+  } catch (e) {
+    return res.status(500).json({ success: false, error: e.message });
   }
 });
 
