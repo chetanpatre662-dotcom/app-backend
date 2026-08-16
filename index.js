@@ -461,7 +461,28 @@ async function handleAttendance(bus, students) {
         att.arrived      = false;
         att.boardingTicks = 0; // clean up counter after confirmation
 
+        // ── Detect actual boarding city from nearest route stop ────────────
+        let boardingCity = null;
+        try {
+          const routeGraph = await getRouteGraph(bus.busId);
+          if (routeGraph && routeGraph.merged && routeGraph.merged.length > 0) {
+            let nearestDist = Infinity;
+            let nearestStop = null;
+            for (const stop of routeGraph.merged) {
+              const d = calculateDistance(loc.lat, loc.lng, stop.lat, stop.lng);
+              if (d < nearestDist) { nearestDist = d; nearestStop = stop; }
+            }
+            // Only assign if within 1.5 km of a known stop
+            if (nearestStop && nearestDist <= 1.5) {
+              boardingCity = nearestStop.name;
+            }
+          }
+        } catch (e) {
+          console.log(`[ATT] boardingCity detection error for ${student.studentId}: ${e.message}`);
+        }
+
         // Atomic write with TTL — crash-safe
+        att.boardingCity = boardingCity;
         await redis.setEx(`att:${ATT_KEY}`, 86400, att);
 
         await admin
@@ -487,6 +508,7 @@ async function handleAttendance(bus, students) {
               studentId:    student.studentId,
               studentName:  student.name  || "",
               city:         student.city  || "",
+              boardingCity: boardingCity || null,
               branch:       student.branch || "",
               course:       student.course || "",
               studentType:  student.studentType || "",
@@ -513,6 +535,7 @@ async function handleAttendance(bus, students) {
           userId:       student.studentId,
           userName:     student.name || "",
           city:         student.city || "",
+          boardingCity: boardingCity || null,
           busId:        bus.busId,
           boardingTime: admin.firestore.FieldValue.serverTimestamp(),
           boardingDate: today,
