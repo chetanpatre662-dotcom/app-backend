@@ -6000,13 +6000,20 @@ app.post("/admin/login", loginLimiter, async (req, res) => {
 
     // Bus Pass Admin
     if (username === process.env.BUSPASS_USERNAME && await bcrypt.compare(password, process.env.BUSPASS_PASS_HASH)) {
-      // Check account verification status in Firestore
-      const verDoc = await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get();
+      // Require email for per-user verification binding
+      const userEmail = (req.body.email || "").trim().toLowerCase();
+      if (!userEmail || !userEmail.includes("@")) {
+        return res.status(400).json({ success: false, error: "Email is required for Bus Pass admin login", requiresEmail: true });
+      }
+
+      // Check per-user verification status (keyed by email)
+      const safeEmailKey = userEmail.replace(/[^a-z0-9@._-]/g, "_");
+      const verDoc = await admin.firestore().collection("buspass_admin_accounts").doc(safeEmailKey).get();
       const verData = verDoc.exists ? verDoc.data() : {};
       const verificationStatus = verData.verificationStatus || "pending";
 
       if (verificationStatus === "revoked") {
-        return res.status(403).json({ success: false, error: "Account has been revoked. Contact College Administration.", requiresVerification: true, status: "revoked" });
+        return res.status(403).json({ success: false, error: "Your account has been revoked. Contact College Administration.", requiresVerification: true, status: "revoked" });
       }
 
       if (verificationStatus !== "verified") {
@@ -6014,7 +6021,8 @@ app.post("/admin/login", loginLimiter, async (req, res) => {
         const requestId = "VR-" + Date.now().toString(36).toUpperCase() + "-" + Math.random().toString(36).substring(2, 6).toUpperCase();
         const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
         await admin.firestore().collection("buspass_login_requests").doc(requestId).set({
-          accountId: "buspass_primary",
+          accountId: safeEmailKey,
+          email: userEmail,
           username: username,
           status: "PENDING",
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -6027,14 +6035,15 @@ app.post("/admin/login", loginLimiter, async (req, res) => {
           requiresVerification: true,
           status: "pending",
           requestId: requestId,
+          email: userEmail,
           message: "Your credentials are correct. College Administration must verify your account before you can access Bus Pass.",
           expiresAt: expiresAt.toISOString(),
         });
       }
 
-      // Account is verified — issue token
+      // Account is verified for this specific email — issue token
       const token = jwt.sign(
-        { admin: true, buspass: true, role: "bus_pass_admin", institution: "college", verified: true },
+        { admin: true, buspass: true, role: "bus_pass_admin", institution: "college", verified: true, email: userEmail },
         process.env.JWT_SECRET,
         { expiresIn: "24h" }
       );
@@ -6609,7 +6618,9 @@ function busPassAuth(req, res, next) {
     req.buspassOperator = decoded.operator || decoded.role || "admin";
     // For bus_pass_admin tokens, verify account hasn't been revoked since token was issued
     if (isBusPassAdmin && !isCollegeAdmin && !isSuperAdmin) {
-      return admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get()
+      const email = decoded.email || "";
+      const safeEmailKey = email ? email.replace(/[^a-z0-9@._-]/g, "_") : "buspass_primary";
+      return admin.firestore().collection("buspass_admin_accounts").doc(safeEmailKey).get()
         .then(doc => {
           const data = doc.exists ? doc.data() : {};
           if (data.verificationStatus === "revoked") {
@@ -6620,7 +6631,7 @@ function busPassAuth(req, res, next) {
           }
           next();
         })
-        .catch(() => next()); // If Firestore fails, allow (fail-open for existing verified tokens)
+        .catch(() => next());
     } else {
       next();
     }
@@ -6855,6 +6866,7 @@ app.get("/api/bus-pass/admin-verification/requests", adminAuth, async (req, res)
       return {
         id: d.id,
         accountId: data.accountId || "",
+        email: data.email || "",
         username: data.username || "",
         status,
         createdAt: data.createdAt,
@@ -6866,11 +6878,12 @@ app.get("/api/bus-pass/admin-verification/requests", adminAuth, async (req, res)
       };
     });
 
-    // Get account verification status
-    const accDoc = await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get();
-    const accountStatus = accDoc.exists ? (accDoc.data().verificationStatus || "pending") : "pending";
+    // Get all per-user account statuses
+    const accSnap = await admin.firestore().collection("buspass_admin_accounts").get();
+    const accounts = {};
+    accSnap.docs.forEach(d => { accounts[d.id] = d.data().verificationStatus || "pending"; });
 
-    return res.json({ success: true, requests, accountStatus });
+    return res.json({ success: true, requests, accounts });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
   }
@@ -6905,9 +6918,11 @@ app.post("/api/bus-pass/admin-verification/approve/:requestId", adminAuth, async
       approvedBy: req.adminRole || "college_admin",
     });
 
-    // Permanently verify the bus pass admin account
-    await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").set({
+    // Permanently verify the bus pass admin account (per-user, keyed by email)
+    const accountKey = reqData.accountId || reqData.email || "buspass_primary";
+    await admin.firestore().collection("buspass_admin_accounts").doc(accountKey).set({
       verificationStatus: "verified",
+      email: reqData.email || "",
       verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
       verifiedBy: req.adminRole || "college_admin",
       lastApprovedRequestId: requestId,
@@ -6954,13 +6969,20 @@ app.post("/api/bus-pass/admin-verification/revoke", adminAuth, async (req, res) 
       return res.status(403).json({ success: false, error: "College Admin access required" });
     }
 
-    await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").set({
+    // Revoke requires an email to identify which account to revoke
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, error: "Email required to identify account to revoke" });
+    }
+    const safeEmailKey = email.trim().toLowerCase().replace(/[^a-z0-9@._-]/g, "_");
+
+    await admin.firestore().collection("buspass_admin_accounts").doc(safeEmailKey).set({
       verificationStatus: "revoked",
       revokedAt: admin.firestore.FieldValue.serverTimestamp(),
       revokedBy: req.adminRole || "college_admin",
     }, { merge: true });
 
-    return res.json({ success: true, message: "Bus Pass Admin account verification revoked" });
+    return res.json({ success: true, message: `Bus Pass Admin account (${email}) verification revoked` });
   } catch (e) {
     return res.status(500).json({ success: false, error: e.message });
   }
@@ -6984,12 +7006,14 @@ app.get("/api/bus-pass/admin-verification/status/:requestId", async (req, res) =
 
     // If approved, also return a fresh token
     if (status === "APPROVED") {
-      // Verify account is still verified
-      const accDoc = await admin.firestore().collection("buspass_admin_accounts").doc("buspass_primary").get();
+      // Verify account is still verified (per-user, keyed by email/accountId)
+      const accountKey = reqData.accountId || reqData.email || "buspass_primary";
+      const accDoc = await admin.firestore().collection("buspass_admin_accounts").doc(accountKey).get();
       const accData = accDoc.exists ? accDoc.data() : {};
       if (accData.verificationStatus === "verified") {
+        const userEmail = reqData.email || "";
         const token = jwt.sign(
-          { admin: true, buspass: true, role: "bus_pass_admin", institution: "college", verified: true },
+          { admin: true, buspass: true, role: "bus_pass_admin", institution: "college", verified: true, email: userEmail },
           process.env.JWT_SECRET,
           { expiresIn: "24h" }
         );
