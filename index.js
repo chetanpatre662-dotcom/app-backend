@@ -3837,14 +3837,14 @@ app.get("/api/rto-mapping", async (req, res) => {
 
 /* ==========================================================================
    TATA PUSH WEBHOOK — Raw Data Receiver (Phase 1)
-   POST /api/tata/push — Receive & store raw Tata payload (PUBLIC, no auth)
-   GET  /api/tata/push — Retrieve stored raw Tata payloads for inspection
+   Public URL: POST/GET https://bustracker.satpudaengineeringcollege.com/api/tata/push
+   Node route: POST/GET /tata/push (Nginx strips /api prefix)
    No bus mapping, no normalization, no pipeline integration yet.
    ========================================================================== */
 const _tataRawStore = []; // In-memory store: last 20 received payloads
 const _TATA_MAX_STORE = 20;
 
-app.post("/api/tata/push", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
+app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
   try {
     const contentType = req.headers["content-type"] || "unknown";
     const receivedAt = new Date().toISOString();
@@ -3876,7 +3876,7 @@ app.post("/api/tata/push", express.raw({ type: "*/*", limit: "1mb" }), (req, res
   }
 });
 
-app.get("/api/tata/push", (req, res) => {
+app.get("/tata/push", (req, res) => {
   return res.json({ success: true, count: _tataRawStore.length, data: _tataRawStore });
 });
 
