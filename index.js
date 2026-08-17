@@ -776,23 +776,9 @@ const smlBusMap = {
 };
 
 /* =========================
-   TATA PUSH — Device-to-Bus Mapping
-   Tata company pushes GPS data for 2 buses via webhook (public, no auth).
-   Device IDs and bus IDs are configurable via environment variables.
+   TATA PUSH — Raw Webhook Receiver (Phase 1)
+   Payload format unknown. Will be analyzed after first real data arrives.
 ========================= */
-const TATA_BUS_MAP = {};
-// Build Tata mapping from environment variables
-if (process.env.TATA_BUS_1_DEVICE && process.env.TATA_BUS_1_ID) {
-  TATA_BUS_MAP[process.env.TATA_BUS_1_DEVICE] = process.env.TATA_BUS_1_ID;
-}
-if (process.env.TATA_BUS_2_DEVICE && process.env.TATA_BUS_2_ID) {
-  TATA_BUS_MAP[process.env.TATA_BUS_2_DEVICE] = process.env.TATA_BUS_2_ID;
-}
-// Source ownership: Tata bus IDs should not be overwritten by Pull APIs
-const TATA_OWNED_BUS_IDS = new Set(Object.values(TATA_BUS_MAP));
-if (Object.keys(TATA_BUS_MAP).length > 0) {
-  console.log(`[TATA] Configured ${Object.keys(TATA_BUS_MAP).length} bus(es):`, TATA_BUS_MAP);
-}
 
 /* ==========================================================================
    GPS DIRECTION ENGINE
@@ -1290,7 +1276,7 @@ async function invalidateRouteCache(busId) {
  */
 async function preWarmRouteCache() {
   const allBusIds = [
-    ...new Set([...Object.values(busMap), ...Object.values(smlBusMap).map((m) => m.busId), ...Object.values(TATA_BUS_MAP)])
+    ...new Set([...Object.values(busMap), ...Object.values(smlBusMap).map((m) => m.busId)])
   ];
   await Promise.allSettled(allBusIds.map((id) => getRouteGraph(normalizeBusId(id))));
 
@@ -2351,9 +2337,6 @@ async function formatBuses(data) {
 
       const busId = busMap[d.imei];
 
-      // ── Skip buses owned by Tata Push (prevents stale Pull data overwriting fresh Push data) ──
-      if (TATA_OWNED_BUS_IDS.has(busId)) return null;
-
       // ── FAST PATH: All cache layers are in-memory after first iteration ──
       // getRouteGraph hits memory cache (O(1) after pre-warm)
       const routeGraph = await getRouteGraph(busId);
@@ -2593,9 +2576,6 @@ async function formatSMLBuses(data) {
 
       const busId = map.busId;
       const imei = map.imei;
-
-      // ── Skip buses owned by Tata Push ──
-      if (TATA_OWNED_BUS_IDS.has(busId)) return null;
 
       const smlLat = Number(item.latitude);
       const smlLng = Number(item.longitude);
@@ -3856,133 +3836,48 @@ app.get("/api/rto-mapping", async (req, res) => {
 });
 
 /* ==========================================================================
-   TATA PUSH WEBHOOK — Receives live GPS data from Tata company
-   POST /api/tata/push (PUBLIC — no authentication required)
+   TATA PUSH WEBHOOK — Raw Data Receiver (Phase 1)
+   POST /api/tata/push — Receive & store raw Tata payload (PUBLIC, no auth)
+   GET  /api/tata/push — Retrieve stored raw Tata payloads for inspection
+   No bus mapping, no normalization, no pipeline integration yet.
    ========================================================================== */
-app.post("/api/tata/push", (req, res) => {
-  // Log incoming payload for first-data inspection
-  console.log("[TATA] Incoming push received");
+const _tataRawStore = []; // In-memory store: last 20 received payloads
+const _TATA_MAX_STORE = 20;
 
+app.post("/api/tata/push", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
   try {
-    const payload = req.body;
-    if (!payload) return res.status(400).json({ success: false, error: "Empty payload" });
+    const contentType = req.headers["content-type"] || "unknown";
+    const receivedAt = new Date().toISOString();
 
-    // Support single object or array of bus locations
-    const items = Array.isArray(payload) ? payload : (payload.data ? (Array.isArray(payload.data) ? payload.data : [payload.data]) : [payload]);
-
-    let processed = 0;
-    let rejected = 0;
-
-    for (const item of items) {
-      // ── Extract fields (adapt field names once Tata provides exact payload) ──
-      const deviceId = (item.deviceId || item.imei || item.vehicleId || item.device_id || "").toString().trim();
-      const lat = parseFloat(item.latitude || item.lat);
-      const lng = parseFloat(item.longitude || item.lng || item.lon);
-      const speed = parseFloat(item.speed || item.spd || 0) || 0;
-      const timestamp = item.timestamp || item.gpsTime || item.time || item.dateTime || null;
-
-      // ── Validate device mapping ──
-      const busId = TATA_BUS_MAP[deviceId];
-      if (!busId) {
-        console.log(`[TATA] Unknown device ignored: ${deviceId}`);
-        rejected++;
-        continue;
-      }
-
-      // ── Validate GPS coordinates ──
-      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-        console.log(`[TATA] Invalid coordinates for ${busId}: lat=${lat} lng=${lng}`);
-        rejected++;
-        continue;
-      }
-
-      // ── Parse timestamp ──
-      let parsedMs = Date.now();
-      if (timestamp) {
-        const ts = typeof timestamp === "number"
-          ? (timestamp > 1e12 ? timestamp : timestamp * 1000)
-          : new Date(timestamp).getTime();
-        if (Number.isFinite(ts) && ts > 0 && ts <= Date.now() + 60000) {
-          parsedMs = ts;
-        }
-      }
-
-      // ── Prevent stale data overwrite: reject if older than cached ──
-      const cached = _lastKnownBuses[busId];
-      if (cached && cached.data && cached.data.timestamp) {
-        const cachedMs = typeof cached.data.timestamp === "number"
-          ? (cached.data.timestamp > 1e12 ? cached.data.timestamp : cached.data.timestamp * 1000)
-          : new Date(cached.data.timestamp).getTime();
-        if (Number.isFinite(cachedMs) && parsedMs < cachedMs) {
-          // Older packet — skip
-          rejected++;
-          continue;
-        }
-      }
-
-      // ── Build normalized bus object (matches existing pipeline format) ──
-      const routeInfo = _routeGraphCache[busId] || {};
-      const normalizedBus = {
-        busId: busId,
-        imei: deviceId,
-        lat: lat,
-        lng: lng,
-        speed: Math.max(0, speed),
-        timestamp: new Date(parsedMs).toISOString(),
-        status: "online",
-        tripActive: speed > 10, // Match existing threshold
-        driver: driverMap[busId] || "",
-        driverMobile: driverMobileMap[busId] || "",
-        route: routeInfo.routeName || "",
-        routeType: "college", // Tata buses are college buses
-        currentCity: "",
-        nextCity: "",
-        gpsState: "LIVE",
-        gpsAgeSeconds: Math.round((Date.now() - parsedMs) / 1000),
-        _source: "tata",
-      };
-
-      // ── Inject into existing bus cache (same mechanism as mergeBusCache) ──
-      _lastKnownBuses[busId] = { data: normalizedBus, lastSeen: Date.now() };
-
-      processed++;
-      console.log(`[TATA] ${busId} updated: lat=${lat.toFixed(5)} lng=${lng.toFixed(5)} speed=${speed} age=${normalizedBus.gpsAgeSeconds}s`);
+    // Capture payload: prefer parsed JSON body from global middleware,
+    // fallback to raw buffer for non-JSON content types
+    let payload;
+    if (req.body && Buffer.isBuffer(req.body)) {
+      // Route-level express.raw() captured it as Buffer
+      const str = req.body.toString("utf8");
+      try { payload = JSON.parse(str); } catch (_) { payload = str; }
+    } else if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+      payload = req.body;
+    } else {
+      payload = null;
     }
 
-    // ── Trigger broadcast if any bus was updated ──
-    if (processed > 0) {
-      // Rebuild latestBuses from cache and broadcast
-      const allCachedBuses = Object.values(_lastKnownBuses)
-        .filter(e => (Date.now() - e.lastSeen) < _BUS_STALE_TIMEOUT_MS)
-        .map(e => e.data);
-      latestBuses = allCachedBuses;
-      broadcast(allCachedBuses);
+    _tataRawStore.unshift({ receivedAt, contentType, payload });
+    if (_tataRawStore.length > _TATA_MAX_STORE) _tataRawStore.length = _TATA_MAX_STORE;
 
-      // Fire side-effects (attendance, distance, notifications) for Tata buses
-      const tataBuses = items.filter((_, i) => {
-        const did = (items[i]?.deviceId || items[i]?.imei || items[i]?.vehicleId || items[i]?.device_id || "").toString().trim();
-        return !!TATA_BUS_MAP[did];
-      }).map((_, i) => {
-        const did = (items[i]?.deviceId || items[i]?.imei || items[i]?.vehicleId || items[i]?.device_id || "").toString().trim();
-        return _lastKnownBuses[TATA_BUS_MAP[did]]?.data;
-      }).filter(Boolean);
+    const logStr = typeof payload === "object" ? JSON.stringify(payload).substring(0, 1000) : String(payload || "").substring(0, 1000);
+    console.log(`[TATA] Push received | ${receivedAt} | Content-Type: ${contentType}`);
+    console.log(`[TATA] Payload: ${logStr}`);
 
-      if (tataBuses.length > 0) {
-        getStudentsCached().then(students => {
-          Promise.all(tataBuses.map(bus => Promise.all([
-            handleBus(bus, students).catch(e => console.log(`[TATA ERR] handleBus ${bus.busId}: ${e.message}`)),
-            handleAttendance(bus, students).catch(e => console.log(`[TATA ERR] handleAttendance ${bus.busId}: ${e.message}`)),
-            trackBusDistance(bus).catch(e => console.log(`[TATA ERR] trackBusDistance ${bus.busId}: ${e.message}`)),
-          ]))).catch(e => console.log("[TATA ERR] side-effects:", e.message));
-        }).catch(() => {});
-      }
-    }
-
-    return res.json({ success: true, processed, rejected });
+    return res.status(200).json({ success: true, message: "Tata data received" });
   } catch (e) {
-    console.log("[TATA] Webhook error:", e.message);
+    console.log(`[TATA] Error: ${e.message}`);
     return res.status(500).json({ success: false, error: "Internal error" });
   }
+});
+
+app.get("/api/tata/push", (req, res) => {
+  return res.json({ success: true, count: _tataRawStore.length, data: _tataRawStore });
 });
 
 app.get("/admin/bus-km-history", adminAuth, async (req, res) => {
