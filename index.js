@@ -738,6 +738,7 @@ const busMap = {
   "860560067136350": "BUS-11",
   "866334078434509": "BUS-15",
   "862567077140767": "BUS-14",
+  "869860089492893": "BUS-2",
 };
 
 const driverMap = {
@@ -776,8 +777,8 @@ const smlBusMap = {
 };
 
 /* =========================
-   TATA PUSH — Raw Webhook Receiver (Phase 1)
-   Payload format unknown. Will be analyzed after first real data arrives.
+   TATA PUSH — BUS-2 via IMEI 869860089492893 in busMap above.
+   Tata integration endpoint is defined later in this file (POST/GET /tata/push).
 ========================= */
 
 /* ==========================================================================
@@ -3336,15 +3337,21 @@ function mergeBusCache(freshBuses) {
       delete _lastKnownBuses[busId];
       continue;
     }
-    merged.push({
-      ...entry.data,
-      speed: 0,
-      tripActive: false,
-      status: "Offline",
-      gpsState: GPS_STATE.OFFLINE,
-      gpsAgeSeconds: Math.round(age / 1000),
-      _stale: true,
-    });
+    // If lastSeen is very recent (<120s), the bus is live via push-based vendor
+    // (e.g., Tata). Preserve its actual data instead of marking stale.
+    if (age < 120000) {
+      merged.push(entry.data);
+    } else {
+      merged.push({
+        ...entry.data,
+        speed: 0,
+        tripActive: false,
+        status: "Offline",
+        gpsState: GPS_STATE.OFFLINE,
+        gpsAgeSeconds: Math.round(age / 1000),
+        _stale: true,
+      });
+    }
   }
 
   const T1 = Date.now();
@@ -3836,40 +3843,133 @@ app.get("/api/rto-mapping", async (req, res) => {
 });
 
 /* ==========================================================================
-   TATA PUSH WEBHOOK — Raw Data Receiver (Phase 1)
+   TATA PUSH WEBHOOK — Live GPS Integration
    Public URL: POST/GET https://bustracker.satpudaengineeringcollege.com/api/tata/push
    Node route: POST/GET /tata/push (Nginx strips /api prefix)
-   No bus mapping, no normalization, no pipeline integration yet.
+   Tata IMEI 869860089492893 → BUS-2 (via busMap)
    ========================================================================== */
-const _tataRawStore = []; // In-memory store: last 20 received payloads
-const _TATA_MAX_STORE = 20;
+const _tataLatestState = {}; // IMEI → { receivedAt, payload, normalizedBus }
 
-app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), (req, res) => {
+app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, res) => {
   try {
-    const contentType = req.headers["content-type"] || "unknown";
-    const receivedAt = new Date().toISOString();
-
-    // Capture payload: prefer parsed JSON body from global middleware,
-    // fallback to raw buffer for non-JSON content types
+    // Parse payload
     let payload;
     if (req.body && Buffer.isBuffer(req.body)) {
-      // Route-level express.raw() captured it as Buffer
       const str = req.body.toString("utf8");
-      try { payload = JSON.parse(str); } catch (_) { payload = str; }
+      try { payload = JSON.parse(str); } catch (_) { payload = null; }
     } else if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
       payload = req.body;
     } else {
       payload = null;
     }
 
-    _tataRawStore.unshift({ receivedAt, contentType, payload });
-    if (_tataRawStore.length > _TATA_MAX_STORE) _tataRawStore.length = _TATA_MAX_STORE;
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ success: false, error: "Invalid or empty payload" });
+    }
 
-    const logStr = typeof payload === "object" ? JSON.stringify(payload).substring(0, 1000) : String(payload || "").substring(0, 1000);
-    console.log(`[TATA] Push received | ${receivedAt} | Content-Type: ${contentType}`);
-    console.log(`[TATA] Payload: ${logStr}`);
+    // Extract and validate IMEI
+    const imei = (payload.imei || "").toString().trim();
+    if (!imei) {
+      return res.status(400).json({ success: false, error: "Missing IMEI" });
+    }
 
-    return res.status(200).json({ success: true, message: "Tata data received" });
+    // IMEI must be mapped in busMap
+    const busId = busMap[imei];
+    if (!busId) {
+      console.log(`[TATA] Unknown IMEI ignored: ${imei}`);
+      return res.status(200).json({ success: true, message: "IMEI not mapped, ignored" });
+    }
+
+    // Extract and validate GPS coordinates
+    const lat = parseFloat(payload.gpsLatitude);
+    const lng = parseFloat(payload.gpsLongitude);
+    if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      console.log(`[TATA] Invalid coordinates for ${busId}: lat=${payload.gpsLatitude} lng=${payload.gpsLongitude}`);
+      return res.status(400).json({ success: false, error: "Invalid GPS coordinates" });
+    }
+
+    const speed = Math.max(0, parseFloat(payload.speed) || 0);
+    const now = Date.now();
+    const receivedAt = new Date(now).toISOString();
+
+    // Parse event timestamp
+    let gpsTimeMs = now;
+    if (payload.eventDateTime) {
+      const parsed = new Date(payload.eventDateTime).getTime();
+      if (Number.isFinite(parsed) && parsed > 0 && parsed <= now + 60000) {
+        gpsTimeMs = parsed;
+      }
+    }
+    const gpsTime = new Date(gpsTimeMs).toISOString();
+
+    // Get route info for this bus (uses cached route graph)
+    const routeGraph = await getRouteGraph(busId);
+    const routeInfo = routeGraph
+      ? getRouteInfo({ busId, lat, lng, speed }, routeGraph)
+      : { currentCity: null, nextCity: null, previousCity: null, distanceToNext: null, direction: null };
+
+    // Build canonical bus object (same structure as formatBuses/formatSMLBuses)
+    const normalizedBus = {
+      busId,
+      driver: driverMap[busId] || "N/A",
+      route: routeGraph?.routeName || "N/A",
+      routeType: routeGraph?.routeType || "college",
+
+      currentCity: routeInfo?.currentCity || null,
+      nextCity: routeInfo?.nextCity || null,
+      previousCity: routeInfo?.previousCity || null,
+      nextCityDistance: routeInfo?.distanceToNext != null ? Number(routeInfo.distanceToNext.toFixed(2)) : null,
+      routeDirection: routeInfo?.direction || null,
+
+      imei,
+      lat,
+      lng,
+      speed,
+      driverMobile: driverMobileMap[busId] || "N/A",
+
+      startTime: busStartTimes[busId]?.time || null,
+      todayKm: busDistanceTracker[busId]?.totalKm?.toFixed(2) || "0",
+      collegeArrivalTime: busCollegeArrival[busId]?.time || null,
+
+      eta: calculateETA(5, speed).text,
+
+      status: getBusStatus({ busId, lat, lng, speed, lastUpdate: gpsTime }),
+      tripActive: speed > 10,
+
+      gpsTime,
+      lastUpdate: gpsTime,
+      timestamp: now,
+
+      gpsAgeSeconds: Math.round((now - gpsTimeMs) / 1000),
+      gpsState: (now - gpsTimeMs) <= 180000 ? "LIVE" : (now - gpsTimeMs) <= 300000 ? "UPDATING" : "OFFLINE",
+      lastGpsUpdateUtc: gpsTime,
+      lastGpsUpdateIst: new Date(gpsTimeMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
+    };
+
+    // Store latest state (one entry per IMEI — replaces previous)
+    _tataLatestState[imei] = { receivedAt, payload, normalizedBus };
+
+    // Inject into existing bus cache (same mechanism used by mergeBusCache)
+    _lastKnownBuses[busId] = { data: normalizedBus, lastSeen: now };
+
+    // Rebuild latestBuses from cache and broadcast immediately
+    const allCachedBuses = Object.values(_lastKnownBuses)
+      .filter(e => (Date.now() - e.lastSeen) < _BUS_STALE_TIMEOUT_MS)
+      .map(e => e.data);
+    latestBuses = allCachedBuses;
+    broadcast(allCachedBuses);
+
+    // Fire side-effects (same as the main loop does for every bus)
+    getStudentsCached().then(students => {
+      Promise.all([
+        handleBus(normalizedBus, students).catch(e => console.log(`[TATA ERR] handleBus ${busId}: ${e.message}`)),
+        handleAttendance(normalizedBus, students).catch(e => console.log(`[TATA ERR] handleAttendance ${busId}: ${e.message}`)),
+        trackBusDistance(normalizedBus).catch(e => console.log(`[TATA ERR] trackBusDistance ${busId}: ${e.message}`)),
+      ]);
+    }).catch(() => {});
+
+    console.log(`[TATA] ${busId} updated | lat=${lat.toFixed(5)} lng=${lng.toFixed(5)} speed=${speed} status=${payload.vehicleStatus || "?"} age=${normalizedBus.gpsAgeSeconds}s`);
+    return res.status(200).json({ success: true, message: "Tata data received", busId });
   } catch (e) {
     console.log(`[TATA] Error: ${e.message}`);
     return res.status(500).json({ success: false, error: "Internal error" });
@@ -3877,7 +3977,19 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), (req, res) =>
 });
 
 app.get("/tata/push", (req, res) => {
-  return res.json({ success: true, count: _tataRawStore.length, data: _tataRawStore });
+  const vehicles = Object.entries(_tataLatestState).map(([imei, entry]) => ({
+    imei,
+    busId: busMap[imei] || "unknown",
+    receivedAt: entry.receivedAt,
+    lat: entry.normalizedBus?.lat,
+    lng: entry.normalizedBus?.lng,
+    speed: entry.normalizedBus?.speed,
+    status: entry.normalizedBus?.status,
+    tripActive: entry.normalizedBus?.tripActive,
+    gpsAgeSeconds: entry.normalizedBus?.gpsAgeSeconds,
+    rawPayload: entry.payload,
+  }));
+  return res.json({ success: true, count: vehicles.length, vehicles });
 });
 
 app.get("/admin/bus-km-history", adminAuth, async (req, res) => {
