@@ -739,6 +739,7 @@ const busMap = {
   "866334078434509": "BUS-15",
   "862567077140767": "BUS-14",
   "869860089492893": "BUS-2",
+  "869372084048852": "BUS-1",
 };
 
 const driverMap = {
@@ -3843,156 +3844,164 @@ app.get("/api/rto-mapping", async (req, res) => {
 });
 
 /* ==========================================================================
-   TATA PUSH WEBHOOK — Live GPS Integration
+   TATA PUSH WEBHOOK — Live GPS Integration (Multi-Vehicle)
    Public URL: POST/GET https://bustracker.satpudaengineeringcollege.com/api/tata/push
    Node route: POST/GET /tata/push (Nginx strips /api prefix)
-   Tata IMEI 869860089492893 → BUS-2 (via busMap)
+   Accepts: single object OR array of vehicle objects
+   Vehicle identity: IMEI (upsert — same IMEI updates, different IMEI = different vehicle)
+   Duplicate IMEI in same request: last entry wins (by array order)
    ========================================================================== */
 const _tataLatestState = {}; // IMEI → { receivedAt, payload, normalizedBus }
 
 app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, res) => {
   try {
-    // Parse payload
-    let payload;
+    // Parse payload (Buffer or pre-parsed object)
+    let parsed;
     if (req.body && Buffer.isBuffer(req.body)) {
       const str = req.body.toString("utf8");
-      try { payload = JSON.parse(str); } catch (_) { payload = null; }
-    } else if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
-      payload = req.body;
+      try { parsed = JSON.parse(str); } catch (_) { parsed = null; }
+    } else if (req.body && typeof req.body === "object") {
+      parsed = req.body;
     } else {
-      payload = null;
+      parsed = null;
     }
 
-    if (!payload || typeof payload !== "object") {
+    if (!parsed || (typeof parsed !== "object")) {
       return res.status(400).json({ success: false, error: "Invalid or empty payload" });
     }
 
-    // Extract and validate IMEI
-    const imei = (payload.imei || "").toString().trim();
-    if (!imei) {
-      return res.status(400).json({ success: false, error: "Missing IMEI" });
+    // Normalize to array: single object → [object], array → as-is
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    if (items.length === 0) {
+      return res.status(400).json({ success: false, error: "Empty payload array" });
     }
 
-    // IMEI must be mapped in busMap
-    const busId = busMap[imei];
-    if (!busId) {
-      console.log(`[TATA] Unknown IMEI ignored: ${imei}`);
-      return res.status(200).json({ success: true, message: "IMEI not mapped, ignored" });
-    }
+    console.log(`[TATA] Received push | payloads=${items.length}`);
 
-    // Extract and validate GPS coordinates
-    const lat = parseFloat(payload.gpsLatitude);
-    const lng = parseFloat(payload.gpsLongitude);
-    if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-      console.log(`[TATA] Invalid coordinates for ${busId}: lat=${payload.gpsLatitude} lng=${payload.gpsLongitude}`);
-      return res.status(400).json({ success: false, error: "Invalid GPS coordinates" });
-    }
-
-    const speed = Math.max(0, parseFloat(payload.speed) || 0);
     const now = Date.now();
     const receivedAt = new Date(now).toISOString();
+    let processed = 0;
+    let unmapped = 0;
+    let rejected = 0;
+    const processedBuses = [];
 
-    // Parse event timestamp — TATA eventDateTime is UTC
-    // Example: "2026-08-18T11:15:15" means 11:15:15 UTC
-    let gpsTimeMs = now;
-    const rawEventDateTime = payload.eventDateTime || null;
-    if (rawEventDateTime) {
-      // If no timezone suffix, treat as UTC by appending Z
-      const raw = String(rawEventDateTime).trim();
-      const normalizedTs = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw}Z`;
-      const parsed = new Date(normalizedTs).getTime();
-      if (Number.isFinite(parsed) && parsed > 0 && parsed <= now + 60000) {
-        gpsTimeMs = parsed;
+    for (const payload of items) {
+      if (!payload || typeof payload !== "object") { rejected++; continue; }
+
+      // Extract and validate IMEI
+      const imei = (payload.imei || "").toString().trim();
+      if (!imei) { rejected++; continue; }
+
+      // IMEI must be mapped in busMap
+      const busId = busMap[imei];
+      if (!busId) {
+        if (!_tataLatestState[imei]) console.log(`[TATA] Unknown IMEI ignored: ${imei}`);
+        unmapped++;
+        continue;
       }
+
+      // Extract and validate GPS coordinates
+      const lat = parseFloat(payload.gpsLatitude);
+      const lng = parseFloat(payload.gpsLongitude);
+      if (isNaN(lat) || isNaN(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        console.log(`[TATA] Invalid coordinates for ${busId}: lat=${payload.gpsLatitude} lng=${payload.gpsLongitude}`);
+        rejected++;
+        continue;
+      }
+
+      const speed = Math.max(0, parseFloat(payload.speed) || 0);
+
+      // Parse event timestamp — TATA eventDateTime is UTC
+      let gpsTimeMs = now;
+      const rawEventDateTime = payload.eventDateTime || null;
+      if (rawEventDateTime) {
+        const raw = String(rawEventDateTime).trim();
+        const normalizedTs = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw}Z`;
+        const ts = new Date(normalizedTs).getTime();
+        if (Number.isFinite(ts) && ts > 0 && ts <= now + 60000) {
+          gpsTimeMs = ts;
+        }
+      }
+      const gpsTime = new Date(gpsTimeMs).toISOString();
+      const gpsAgeSeconds = Math.round((now - gpsTimeMs) / 1000);
+
+      // Log BUS UPDATE delay
+      logBusUpdate(busId, gpsTime, gpsTimeMs);
+
+      // Diagnostic: print full raw packet ONCE per IMEI (first time after server start)
+      const isNewImei = !_tataLatestState[imei];
+      if (isNewImei) {
+        console.log(`\n==================== RAW TATA PACKET [${busId}] ====================`);
+        console.log(JSON.stringify(payload, null, 2));
+        console.log(`====================================================================\n`);
+      }
+
+      // Timestamp diagnostic
+      const gpsIst = new Date(gpsTimeMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+      console.log(`[TATA TIMESTAMP] bus=${busId} raw=${rawEventDateTime} age=${gpsAgeSeconds}s (${(gpsAgeSeconds/60).toFixed(1)}min) ist=${gpsIst}`);
+
+      // Get route info
+      const routeGraph = await getRouteGraph(busId);
+      const routeInfo = routeGraph
+        ? getRouteInfo({ busId, lat, lng, speed }, routeGraph)
+        : { currentCity: null, nextCity: null, previousCity: null, distanceToNext: null, direction: null };
+
+      // Build canonical bus object
+      const normalizedBus = {
+        busId,
+        driver: driverMap[busId] || "N/A",
+        route: routeGraph?.routeName || "N/A",
+        routeType: routeGraph?.routeType || "college",
+        currentCity: routeInfo?.currentCity || null,
+        nextCity: routeInfo?.nextCity || null,
+        previousCity: routeInfo?.previousCity || null,
+        nextCityDistance: routeInfo?.distanceToNext != null ? Number(routeInfo.distanceToNext.toFixed(2)) : null,
+        routeDirection: routeInfo?.direction || null,
+        imei, lat, lng, speed,
+        driverMobile: driverMobileMap[busId] || "N/A",
+        startTime: busStartTimes[busId]?.time || null,
+        todayKm: busDistanceTracker[busId]?.totalKm?.toFixed(2) || "0",
+        collegeArrivalTime: busCollegeArrival[busId]?.time || null,
+        eta: calculateETA(5, speed).text,
+        status: getBusStatus({ busId, lat, lng, speed, lastUpdate: gpsTime }),
+        tripActive: speed > 10,
+        gpsTime, lastUpdate: gpsTime, timestamp: now,
+        gpsAgeSeconds,
+        gpsState: gpsAgeSeconds <= 180 ? "LIVE" : gpsAgeSeconds <= 300 ? "UPDATING" : "OFFLINE",
+        lastGpsUpdateUtc: gpsTime,
+        lastGpsUpdateIst: gpsIst,
+      };
+
+      // Upsert: store latest state by IMEI (replaces previous for same IMEI)
+      _tataLatestState[imei] = { receivedAt, payload, normalizedBus };
+
+      // Inject into existing bus cache
+      _lastKnownBuses[busId] = { data: normalizedBus, lastSeen: now };
+
+      // Fire side-effects async (per vehicle)
+      getStudentsCached().then(students => {
+        Promise.all([
+          handleBus(normalizedBus, students).catch(e => console.log(`[TATA ERR] handleBus ${busId}: ${e.message}`)),
+          handleAttendance(normalizedBus, students).catch(e => console.log(`[TATA ERR] handleAttendance ${busId}: ${e.message}`)),
+          trackBusDistance(normalizedBus).catch(e => console.log(`[TATA ERR] trackBusDistance ${busId}: ${e.message}`)),
+        ]);
+      }).catch(() => {});
+
+      console.log(`[TATA] ${isNewImei ? "NEW" : ""} IMEI=${imei} → ${busId} ${isNewImei ? "ACCEPTED" : "UPDATED"} | lat=${lat.toFixed(5)} lng=${lng.toFixed(5)} speed=${speed} status=${payload.vehicleStatus || "?"} age=${gpsAgeSeconds}s`);
+      processedBuses.push(busId);
+      processed++;
     }
-    const gpsTime = new Date(gpsTimeMs).toISOString();
-    const gpsAgeSeconds = Math.round((now - gpsTimeMs) / 1000);
 
-    // Log BUS UPDATE delay (same mechanism as Volty/SML)
-    logBusUpdate(busId, gpsTime, gpsTimeMs);
-
-    // ── TATA Diagnostic Logging (SML-style) ─────────────────────────────────
-    // Print full raw packet ONCE per bus (first time after server start)
-    if (!_tataLatestState[imei]) {
-      console.log(`\n==================== RAW TATA PACKET [${busId}] ====================`);
-      console.log(JSON.stringify(payload, null, 2));
-      console.log(`====================================================================\n`);
+    // Broadcast once after all vehicles processed (single WebSocket emission)
+    if (processed > 0) {
+      const allCachedBuses = Object.values(_lastKnownBuses)
+        .filter(e => (Date.now() - e.lastSeen) < _BUS_STALE_TIMEOUT_MS)
+        .map(e => e.data);
+      latestBuses = allCachedBuses;
+      broadcast(allCachedBuses);
     }
-    // Timestamp diagnostic
-    const serverUtc = new Date(now).toISOString();
-    const serverIst = new Date(now).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-    const gpsIst = new Date(gpsTimeMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
-    console.log(`[TATA TIMESTAMP] bus=${busId} raw=${rawEventDateTime} parsed=${gpsTimeMs} ist=${gpsIst} serverUtc=${serverUtc} serverIst=${serverIst} age=${gpsAgeSeconds}s (${(gpsAgeSeconds/60).toFixed(1)}min)`);
 
-
-    // Get route info for this bus (uses cached route graph)
-    const routeGraph = await getRouteGraph(busId);
-    const routeInfo = routeGraph
-      ? getRouteInfo({ busId, lat, lng, speed }, routeGraph)
-      : { currentCity: null, nextCity: null, previousCity: null, distanceToNext: null, direction: null };
-
-    // Build canonical bus object (same structure as formatBuses/formatSMLBuses)
-    const normalizedBus = {
-      busId,
-      driver: driverMap[busId] || "N/A",
-      route: routeGraph?.routeName || "N/A",
-      routeType: routeGraph?.routeType || "college",
-
-      currentCity: routeInfo?.currentCity || null,
-      nextCity: routeInfo?.nextCity || null,
-      previousCity: routeInfo?.previousCity || null,
-      nextCityDistance: routeInfo?.distanceToNext != null ? Number(routeInfo.distanceToNext.toFixed(2)) : null,
-      routeDirection: routeInfo?.direction || null,
-
-      imei,
-      lat,
-      lng,
-      speed,
-      driverMobile: driverMobileMap[busId] || "N/A",
-
-      startTime: busStartTimes[busId]?.time || null,
-      todayKm: busDistanceTracker[busId]?.totalKm?.toFixed(2) || "0",
-      collegeArrivalTime: busCollegeArrival[busId]?.time || null,
-
-      eta: calculateETA(5, speed).text,
-
-      status: getBusStatus({ busId, lat, lng, speed, lastUpdate: gpsTime }),
-      tripActive: speed > 10,
-
-      gpsTime,
-      lastUpdate: gpsTime,
-      timestamp: now,
-
-      gpsAgeSeconds: gpsAgeSeconds,
-      gpsState: gpsAgeSeconds <= 180 ? "LIVE" : gpsAgeSeconds <= 300 ? "UPDATING" : "OFFLINE",
-      lastGpsUpdateUtc: gpsTime,
-      lastGpsUpdateIst: new Date(gpsTimeMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
-    };
-
-    // Store latest state (one entry per IMEI — replaces previous)
-    _tataLatestState[imei] = { receivedAt, payload, normalizedBus };
-
-    // Inject into existing bus cache (same mechanism used by mergeBusCache)
-    _lastKnownBuses[busId] = { data: normalizedBus, lastSeen: now };
-
-    // Rebuild latestBuses from cache and broadcast immediately
-    const allCachedBuses = Object.values(_lastKnownBuses)
-      .filter(e => (Date.now() - e.lastSeen) < _BUS_STALE_TIMEOUT_MS)
-      .map(e => e.data);
-    latestBuses = allCachedBuses;
-    broadcast(allCachedBuses);
-
-    // Fire side-effects (same as the main loop does for every bus)
-    getStudentsCached().then(students => {
-      Promise.all([
-        handleBus(normalizedBus, students).catch(e => console.log(`[TATA ERR] handleBus ${busId}: ${e.message}`)),
-        handleAttendance(normalizedBus, students).catch(e => console.log(`[TATA ERR] handleAttendance ${busId}: ${e.message}`)),
-        trackBusDistance(normalizedBus).catch(e => console.log(`[TATA ERR] trackBusDistance ${busId}: ${e.message}`)),
-      ]);
-    }).catch(() => {});
-
-    console.log(`[TATA] ${busId} updated | lat=${lat.toFixed(5)} lng=${lng.toFixed(5)} speed=${speed} status=${payload.vehicleStatus || "?"} ignition=${payload.ignitionOn ?? "?"} age=${gpsAgeSeconds}s gpsState=${normalizedBus.gpsState}`);
-    return res.status(200).json({ success: true, message: "Tata data received", busId });
+    return res.status(200).json({ success: true, processed, unmapped, rejected, buses: processedBuses });
   } catch (e) {
     console.log(`[TATA] Error: ${e.message}`);
     return res.status(500).json({ success: false, error: "Internal error" });
