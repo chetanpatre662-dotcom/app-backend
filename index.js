@@ -3892,15 +3892,38 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
     const now = Date.now();
     const receivedAt = new Date(now).toISOString();
 
-    // Parse event timestamp
+    // Parse event timestamp — TATA eventDateTime is UTC
+    // Example: "2026-08-18T11:15:15" means 11:15:15 UTC
     let gpsTimeMs = now;
-    if (payload.eventDateTime) {
-      const parsed = new Date(payload.eventDateTime).getTime();
+    const rawEventDateTime = payload.eventDateTime || null;
+    if (rawEventDateTime) {
+      // If no timezone suffix, treat as UTC by appending Z
+      const raw = String(rawEventDateTime).trim();
+      const normalizedTs = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw) ? raw : `${raw}Z`;
+      const parsed = new Date(normalizedTs).getTime();
       if (Number.isFinite(parsed) && parsed > 0 && parsed <= now + 60000) {
         gpsTimeMs = parsed;
       }
     }
     const gpsTime = new Date(gpsTimeMs).toISOString();
+    const gpsAgeSeconds = Math.round((now - gpsTimeMs) / 1000);
+
+    // Log BUS UPDATE delay (same mechanism as Volty/SML)
+    logBusUpdate(busId, gpsTime, gpsTimeMs);
+
+    // ── TATA Diagnostic Logging (SML-style) ─────────────────────────────────
+    // Print full raw packet ONCE per bus (first time after server start)
+    if (!_tataLatestState[imei]) {
+      console.log(`\n==================== RAW TATA PACKET [${busId}] ====================`);
+      console.log(JSON.stringify(payload, null, 2));
+      console.log(`====================================================================\n`);
+    }
+    // Timestamp diagnostic
+    const serverUtc = new Date(now).toISOString();
+    const serverIst = new Date(now).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+    const gpsIst = new Date(gpsTimeMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+    console.log(`[TATA TIMESTAMP] bus=${busId} raw=${rawEventDateTime} parsed=${gpsTimeMs} ist=${gpsIst} serverUtc=${serverUtc} serverIst=${serverIst} age=${gpsAgeSeconds}s (${(gpsAgeSeconds/60).toFixed(1)}min)`);
+
 
     // Get route info for this bus (uses cached route graph)
     const routeGraph = await getRouteGraph(busId);
@@ -3940,8 +3963,8 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
       lastUpdate: gpsTime,
       timestamp: now,
 
-      gpsAgeSeconds: Math.round((now - gpsTimeMs) / 1000),
-      gpsState: (now - gpsTimeMs) <= 180000 ? "LIVE" : (now - gpsTimeMs) <= 300000 ? "UPDATING" : "OFFLINE",
+      gpsAgeSeconds: gpsAgeSeconds,
+      gpsState: gpsAgeSeconds <= 180 ? "LIVE" : gpsAgeSeconds <= 300 ? "UPDATING" : "OFFLINE",
       lastGpsUpdateUtc: gpsTime,
       lastGpsUpdateIst: new Date(gpsTimeMs).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
     };
@@ -3968,7 +3991,7 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
       ]);
     }).catch(() => {});
 
-    console.log(`[TATA] ${busId} updated | lat=${lat.toFixed(5)} lng=${lng.toFixed(5)} speed=${speed} status=${payload.vehicleStatus || "?"} age=${normalizedBus.gpsAgeSeconds}s`);
+    console.log(`[TATA] ${busId} updated | lat=${lat.toFixed(5)} lng=${lng.toFixed(5)} speed=${speed} status=${payload.vehicleStatus || "?"} ignition=${payload.ignitionOn ?? "?"} age=${gpsAgeSeconds}s gpsState=${normalizedBus.gpsState}`);
     return res.status(200).json({ success: true, message: "Tata data received", busId });
   } catch (e) {
     console.log(`[TATA] Error: ${e.message}`);
