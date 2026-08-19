@@ -6807,7 +6807,7 @@ app.post("/api/bus-pass/verify/:studentId", busPassAuth, async (req, res) => {
       passId = "SCEP-" + String(lastNumber).padStart(4, "0");
     }
     const expiry = expiryDate || (() => { const now = new Date(); const aug1 = new Date(now.getFullYear(), 7, 1); return (now < aug1 ? aug1 : new Date(now.getFullYear() + 1, 7, 1)).toISOString().split("T")[0]; })();
-    await studentRef.update({ verifiedForBusPass: true, busPassId: passId, verifiedAt: admin.firestore.FieldValue.serverTimestamp(), verifiedBy: req.buspassOperator, busPassExpiry: expiry, session: session || studentData.session || "" });
+    await studentRef.update({ verifiedForBusPass: true, busPassId: passId, busPassApprovedRollNumber: studentData.rollNumber || "", verifiedAt: admin.firestore.FieldValue.serverTimestamp(), verifiedBy: req.buspassOperator, busPassExpiry: expiry, session: session || studentData.session || "" });
     // Notify student
     await createUserNotification(req.params.studentId, "bus_pass", "Bus Pass Verified!", "Your bus pass has been verified and is now active.", { passId, expiry });
     return res.json({ success: true, passId, expiry, message: "Student verified" });
@@ -6819,7 +6819,9 @@ app.post("/api/bus-pass/renew/:studentId", busPassAuth, async (req, res) => {
     const { studentId } = req.params;
     const { expiryDate } = req.body;
     const expiry = expiryDate || (() => { const now = new Date(); const aug1 = new Date(now.getFullYear(), 7, 1); return (now < aug1 ? aug1 : new Date(now.getFullYear() + 1, 7, 1)).toISOString().split("T")[0]; })();
-    await admin.firestore().collection("students").doc(studentId).update({ verifiedForBusPass: true, busPassExpiry: expiry, verifiedAt: admin.firestore.FieldValue.serverTimestamp(), verifiedBy: req.buspassOperator });
+    const studentDoc = await admin.firestore().collection("students").doc(studentId).get();
+    const studentData = studentDoc.exists ? studentDoc.data() : {};
+    await admin.firestore().collection("students").doc(studentId).update({ verifiedForBusPass: true, busPassApprovedRollNumber: studentData.rollNumber || "", busPassExpiry: expiry, verifiedAt: admin.firestore.FieldValue.serverTimestamp(), verifiedBy: req.buspassOperator });
     return res.json({ success: true, expiry, message: "Pass renewed" });
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
@@ -7342,7 +7344,104 @@ async function authenticateAny(req, res, next) {
   return res.status(401).json({ error: "Authentication required" });
 }
 
-// -- GET /api/bus-pass/student/:studentId � secured with Firebase ID Token ----
+// ------------------------------------------------------------------------------
+// POST /api/student/update-profile — Server-side profile update with:
+//   • Roll number uniqueness enforcement
+//   • Name and mobile validation
+// Secured with Firebase ID Token (authenticateFirebaseUser middleware)
+// ------------------------------------------------------------------------------
+app.post("/api/student/update-profile", authenticateFirebaseUser, async (req, res) => {
+  try {
+    const { name, rollNumber, mobile } = req.body;
+    const uid = req.firebaseUid;
+
+    // Find the student doc owned by this authenticated user
+    const snap = await admin.firestore().collection("students")
+      .where("uid", "==", uid).limit(1).get();
+    if (snap.empty) {
+      return res.status(404).json({ success: false, error: "Student not found for this account" });
+    }
+
+    const studentDoc = snap.docs[0];
+    const studentId = studentDoc.id;
+    const currentData = studentDoc.data();
+
+    // Build update map — only include changed/non-empty fields
+    const updateData = {};
+    let rollNumberChanged = false;
+
+    if (name !== undefined && name.trim() !== "") {
+      const trimmedName = name.trim();
+      if (trimmedName !== (currentData.name || "")) {
+        updateData.name = trimmedName;
+        updateData.nameLower = trimmedName.toLowerCase();
+      }
+    }
+
+    if (mobile !== undefined && mobile.trim() !== "") {
+      const trimmedMobile = mobile.trim();
+      if (trimmedMobile !== (currentData.mobile || "")) {
+        if (trimmedMobile.length !== 10 || !/^\d{10}$/.test(trimmedMobile)) {
+          return res.status(400).json({ success: false, error: "Mobile number must be exactly 10 digits" });
+        }
+        updateData.mobile = trimmedMobile;
+      }
+    }
+
+    if (rollNumber !== undefined) {
+      const newRoll = rollNumber.trim().toUpperCase();
+      const currentRoll = (currentData.rollNumber || "").toUpperCase();
+
+      if (newRoll !== currentRoll) {
+        if (newRoll === "") {
+          // Clearing roll number is allowed
+          updateData.rollNumber = "";
+          rollNumberChanged = true;
+        } else {
+          // ── SERVER-SIDE UNIQUENESS CHECK ──
+          const existingSnap = await admin.firestore().collection("students")
+            .where("rollNumber", "==", newRoll).limit(1).get();
+
+          if (!existingSnap.empty && existingSnap.docs[0].id !== studentId) {
+            return res.status(409).json({
+              success: false,
+              error: "Roll number already exists. This roll number is registered to another student."
+            });
+          }
+
+          updateData.rollNumber = newRoll;
+          rollNumberChanged = true;
+        }
+      }
+    }
+
+    // Nothing to update
+    if (Object.keys(updateData).length === 0) {
+      return res.json({ success: true, message: "No changes to save", rollNumberChanged: false });
+    }
+
+    // Perform the update
+    await admin.firestore().collection("students").doc(studentId).update(updateData);
+
+    console.log(`[PROFILE] Updated ${studentId}: ${JSON.stringify(Object.keys(updateData))}`);
+
+    return res.json({
+      success: true,
+      message: "Profile updated successfully",
+      rollNumberChanged,
+      updatedFields: Object.keys(updateData),
+    });
+  } catch (e) {
+    console.error("[PROFILE] Update error:", e.message);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// -- GET /api/bus-pass/student/:studentId — secured with Firebase ID Token ----
+// Bus pass resolution is ALWAYS based on the user's CURRENT rollNumber.
+// Flow: authenticated UID → user's doc → current rollNumber → check if it matches
+// the roll number that was active when admin approved (busPassApprovedRollNumber).
+// If currentRollNumber !== busPassApprovedRollNumber → status = "pending".
 app.get("/api/bus-pass/student/:studentId", authenticateFirebaseUser, async (req, res) => {
   try {
     const { studentId } = req.params;
@@ -7354,16 +7453,48 @@ app.get("/api/bus-pass/student/:studentId", authenticateFirebaseUser, async (req
     const d = doc.data();
     // Ownership: verified UID must match document UID
     if (d.uid !== req.firebaseUid) {
-      return res.status(403).json({ error: "Access denied � you can only view your own pass" });
+      return res.status(403).json({ error: "Access denied - you can only view your own pass" });
     }
+
+    // ── ROLL-NUMBER-BASED BUS PASS RESOLUTION ──
+    // The bus pass approval is tied to the roll number that was current at approval time.
+    // busPassApprovedRollNumber is set by admin when verifying/renewing.
+    // If user's current rollNumber matches → verified. Otherwise → pending.
+    //
+    // SAFE LEGACY BACKFILL: If busPassApprovedRollNumber field does not exist AND
+    // the student is already approved (verifiedForBusPass=true) AND has a rollNumber,
+    // we backfill busPassApprovedRollNumber = currentRollNumber (one-time migration).
+    // This is safe because:
+    //   - The student was approved with their current roll (no change happened yet)
+    //   - We do NOT overwrite an existing busPassApprovedRollNumber
+    //   - We do NOT approve an unverified student (only runs when verifiedForBusPass=true)
+    //   - After backfill, if they change roll, the comparison will correctly fail
+    const currentRoll = (d.rollNumber || "").trim().toUpperCase();
+    let approvedRoll = d.busPassApprovedRollNumber !== undefined
+      ? (d.busPassApprovedRollNumber || "").trim().toUpperCase()
+      : null; // null = field not set (legacy)
+
+    // One-time safe backfill for legacy approved students
+    if (approvedRoll === null && d.verifiedForBusPass === true && currentRoll !== "") {
+      approvedRoll = currentRoll;
+      // Persist backfill so future requests use normal comparison path
+      admin.firestore().collection("students").doc(studentId).update({
+        busPassApprovedRollNumber: d.rollNumber || ""
+      }).catch(e => console.error(`[BUS-PASS] Backfill failed for ${studentId}:`, e.message));
+    }
+
     let status = "pending";
     if (d.verifiedForBusPass === true) {
-      status = (d.busPassExpiry && new Date(d.busPassExpiry) < new Date()) ? "expired" : "verified";
+      if (currentRoll !== "" && approvedRoll !== null && currentRoll === approvedRoll) {
+        status = (d.busPassExpiry && new Date(d.busPassExpiry) < new Date()) ? "expired" : "verified";
+      }
+      // else: roll number doesn't match approved roll (or is empty) → remains "pending"
     }
+
     return res.json({ success: true, pass: {
       name: d.name||"", rollNumber: d.rollNumber||"", branch: d.branch||"",
       course: d.course||"", year: d.year||d.academicYear||"", busId: d.busId||"",
-      city: d.city||"", busPassId: d.busPassId||null, verifiedForBusPass: d.verifiedForBusPass||false,
+      city: d.city||"", busPassId: d.busPassId||null, verifiedForBusPass: (status === "verified"),
       busPassExpiry: d.busPassExpiry||null, session: d.session||"", status,
       passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, photoChangeLimit: 3,
     }});
