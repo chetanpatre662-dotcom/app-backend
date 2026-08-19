@@ -7411,15 +7411,17 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     const studentDoc = snap.docs[0];
     const studentId = studentDoc.id;
     const d = studentDoc.data();
-    // SERVER-SIDE limit enforcement: hard limit of 3 photo uploads
-    const currentYear = new Date().getFullYear();
+    // SERVER-SIDE limit enforcement: hard limit of 3 photo uploads per academic year
+    // Academic year resets on August 1st each year
+    const now = new Date();
+    const currentAcademicYear = now.getMonth() >= 7 ? now.getFullYear() : now.getFullYear() - 1; // Aug(7)=current year, Jan-Jul=previous year
     let count = d.photoChangeCount || 0;
-    if ((d.photoChangeResetYear || 0) < currentYear) count = 0;
-    console.log("[BACKEND 4] studentId:", studentId, "count:", count, "limit: 3");
+    if ((d.photoChangeResetYear || 0) < currentAcademicYear) count = 0;
+    console.log("[BACKEND 4] studentId:", studentId, "count:", count, "limit: 3, academicYear:", currentAcademicYear);
     if (count >= 3) {
       console.log("[BACKEND 4] ❌ LIMIT REACHED. count >= 3");
       return res.status(429).json({
-        error: "Maximum 3 photo uploads allowed",
+        error: "Maximum 3 photo uploads allowed per academic year (resets Aug 1)",
         photoChangeCount: count,
         photoChangeLimit: 3,
       });
@@ -7450,7 +7452,7 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
       passPhotoUrl: signedUrl,
       passPhotoPath: filePath,
       photoChangeCount: count,
-      photoChangeResetYear: currentYear,
+      photoChangeResetYear: currentAcademicYear,
       photoUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     console.log("[BACKEND 10] Updating Firestore... photoChangeCount:", count);
