@@ -6783,7 +6783,7 @@ app.get("/api/bus-pass/students", busPassAuth, async (req, res) => {
         if (data.busPassExpiry && new Date(data.busPassExpiry) < new Date()) status = "expired";
         else status = "verified";
       }
-      return { id: d.id, name: data.name||"", rollNumber: data.rollNumber||"", branch: data.branch||"", course: data.course||"", year: data.year||data.academicYear||"", busId: data.busId||"", busPassId: data.busPassId||null, verifiedForBusPass: data.verifiedForBusPass||false, verifiedAt: data.verifiedAt||null, busPassExpiry: data.busPassExpiry||null, session: data.session||"", status, passPhotoUrl: data.passPhotoUrl||null };
+      return { id: d.id, name: data.name||"", rollNumber: data.rollNumber||"", branch: data.branch||"", course: data.course||"", year: data.year||data.academicYear||"", busId: data.busId||"", city: data.city||"", busPassId: data.busPassId||null, verifiedForBusPass: data.verifiedForBusPass||false, verifiedAt: data.verifiedAt||null, busPassExpiry: data.busPassExpiry||null, session: data.session||"", status, passPhotoUrl: data.passPhotoUrl||null };
     });
     return res.json({ success: true, total: students.length, verified: students.filter(s=>s.status==="verified").length, pending: students.filter(s=>s.status==="pending").length, expired: students.filter(s=>s.status==="expired").length, students });
   } catch (e) { return res.status(500).json({ error: e.message }); }
@@ -6831,7 +6831,128 @@ app.post("/api/bus-pass/revoke/:studentId", busPassAuth, async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ROLL NUMBER — Atomic uniqueness via rollNumberRegistry collection
+// ══════════════════════════════════════════════════════════════════════════════
+// Helper: Claims a roll number atomically using Firestore transaction.
+// - rollNumberRegistry/{NORMALIZED_ROLL} doc = { studentId, claimedAt }
+// - Guarantees ONE ROLL NUMBER = ONE USER globally.
+// - Handles releasing old roll number when a student changes theirs.
+// Returns: { success: true } or throws an error string.
+async function claimRollNumberAtomic(studentId, newRollRaw, oldRollRaw) {
+  const db = admin.firestore();
+  const newRoll = (newRollRaw || "").trim().toUpperCase();
+  const oldRoll = (oldRollRaw || "").trim().toUpperCase();
+
+  // Same roll (no-op)
+  if (newRoll === oldRoll) return { success: true, rollNumber: newRoll };
+
+  // Clearing roll number — just release old claim
+  if (newRoll === "") {
+    await db.runTransaction(async (t) => {
+      // Release old registry entry if it belongs to this student
+      if (oldRoll !== "") {
+        const oldRegRef = db.collection("rollNumberRegistry").doc(oldRoll);
+        const oldRegDoc = await t.get(oldRegRef);
+        if (oldRegDoc.exists && oldRegDoc.data().studentId === studentId) {
+          t.delete(oldRegRef);
+        }
+      }
+      // Clear roll on student doc
+      const studentRef = db.collection("students").doc(studentId);
+      t.update(studentRef, { rollNumber: "" });
+    });
+    return { success: true, rollNumber: "" };
+  }
+
+  // Claim new roll number atomically
+  await db.runTransaction(async (t) => {
+    const regRef = db.collection("rollNumberRegistry").doc(newRoll);
+    const regDoc = await t.get(regRef);
+
+    // Check if registry entry exists and belongs to a DIFFERENT student
+    if (regDoc.exists) {
+      const owner = regDoc.data().studentId;
+      if (owner !== studentId) {
+        throw new Error("DUPLICATE");
+      }
+      // Already owned by this student — no-op for registry
+    }
+
+    // Also verify no student doc has this roll (covers legacy data not yet in registry)
+    const existingSnap = await t.get(
+      db.collection("students").where("rollNumber", "==", newRoll)
+    );
+    for (const doc of existingSnap.docs) {
+      if (doc.id !== studentId) {
+        // Legacy duplicate found — claim registry for that owner and reject
+        t.set(regRef, { studentId: doc.id, claimedAt: admin.firestore.FieldValue.serverTimestamp() });
+        throw new Error("DUPLICATE");
+      }
+    }
+
+    // Release old roll registry entry
+    if (oldRoll !== "" && oldRoll !== newRoll) {
+      const oldRegRef = db.collection("rollNumberRegistry").doc(oldRoll);
+      const oldRegDoc = await t.get(oldRegRef);
+      if (oldRegDoc.exists && oldRegDoc.data().studentId === studentId) {
+        t.delete(oldRegRef);
+      }
+    }
+
+    // Claim the new roll in registry
+    t.set(regRef, { studentId, claimedAt: admin.firestore.FieldValue.serverTimestamp() });
+
+    // Update student document
+    const studentRef = db.collection("students").doc(studentId);
+    t.update(studentRef, { rollNumber: newRoll });
+  });
+
+  return { success: true, rollNumber: newRoll };
+}
+
+// -- POST /api/student/claim-roll-number — Student claims/updates their own roll number --
+// Uses Firebase ID Token auth. Atomic transaction guarantees uniqueness.
+app.post("/student/claim-roll-number", authenticateFirebaseUser, async (req, res) => {
+  try {
+    const { rollNumber } = req.body;
+    console.log("[ROLL][BACKEND] claim request received");
+    if (rollNumber === undefined) {
+      return res.status(400).json({ success: false, error: "INVALID_ROLL_NUMBER", message: "rollNumber is required" });
+    }
+    const normalizedRoll = (rollNumber || "").trim().toUpperCase();
+    console.log(`[ROLL][BACKEND] normalizedRoll=${normalizedRoll}`);
+
+    // Find the student doc owned by this authenticated user
+    const snap = await admin.firestore().collection("students")
+      .where("uid", "==", req.firebaseUid).limit(1).get();
+    if (snap.empty) {
+      console.log("[ROLL][BACKEND] student not found for uid:", req.firebaseUid);
+      return res.status(404).json({ success: false, error: "NOT_FOUND", message: "Student not found for this account" });
+    }
+
+    const studentDoc = snap.docs[0];
+    const studentId = studentDoc.id;
+    const currentData = studentDoc.data();
+    const oldRoll = currentData.rollNumber || "";
+    console.log(`[ROLL][BACKEND] studentId=${studentId} oldRoll=${oldRoll}`);
+
+    console.log("[ROLL][BACKEND] transaction started");
+    const result = await claimRollNumberAtomic(studentId, rollNumber, oldRoll);
+    console.log(`[ROLL][BACKEND] transaction success — rollNumber=${result.rollNumber}`);
+    return res.json(result);
+  } catch (e) {
+    if (e.message === "DUPLICATE") {
+      console.log("[ROLL][BACKEND] duplicate detected");
+      return res.status(409).json({ success: false, error: "ROLL_NUMBER_EXISTS", message: "Roll number already exists. Please enter a different roll number." });
+    }
+    console.error("[ROLL][BACKEND] transaction failed:", e.message);
+    return res.status(500).json({ success: false, error: "SERVER_ERROR", message: "Failed to update roll number. Please try again." });
+  }
+});
+
 // -- POST /api/bus-pass/update-roll/:studentId — Admin edits student roll number --
+// Uses atomic transaction for global uniqueness. Admin auth (busPassAuth).
 app.post("/api/bus-pass/update-roll/:studentId", busPassAuth, async (req, res) => {
   try {
     const { studentId } = req.params;
@@ -6839,10 +6960,23 @@ app.post("/api/bus-pass/update-roll/:studentId", busPassAuth, async (req, res) =
     if (rollNumber === undefined) {
       return res.status(400).json({ success: false, error: "rollNumber is required" });
     }
-    const newRoll = (rollNumber || "").trim().toUpperCase();
-    await admin.firestore().collection("students").doc(studentId).update({ rollNumber: newRoll });
-    return res.json({ success: true, message: "Roll number updated", rollNumber: newRoll });
-  } catch (e) { return res.status(500).json({ success: false, error: e.message }); }
+
+    // Get current student's existing roll number
+    const studentDoc = await admin.firestore().collection("students").doc(studentId).get();
+    if (!studentDoc.exists) {
+      return res.status(404).json({ success: false, error: "Student not found" });
+    }
+    const oldRoll = studentDoc.data().rollNumber || "";
+
+    const result = await claimRollNumberAtomic(studentId, rollNumber, oldRoll);
+    return res.json({ ...result, message: "Roll number updated" });
+  } catch (e) {
+    if (e.message === "DUPLICATE") {
+      return res.status(409).json({ success: false, error: "Roll number already exists" });
+    }
+    console.error("[ADMIN-ROLL] Error:", e.message);
+    return res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -7418,13 +7552,45 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     console.log("[BACKEND 3] buffer.length:", req.file.buffer?.length);
     console.log("[BACKEND 3] encoding:", req.file.encoding);
     console.log("[BACKEND 3] fieldname:", req.file.fieldname);
-    // Find student by VERIFIED UID (from middleware — cannot be forged)
-    const snap = await admin.firestore().collection("students")
+    // Find user by VERIFIED UID across all collections (students, faculty, parents)
+    let userDoc = null;
+    let userId = null;
+    let userCollection = null;
+
+    // Check students first
+    const studentSnap = await admin.firestore().collection("students")
       .where("uid", "==", req.firebaseUid).limit(1).get();
-    if (snap.empty) return res.status(404).json({ error: "Student not found for this account" });
-    const studentDoc = snap.docs[0];
-    const studentId = studentDoc.id;
-    const d = studentDoc.data();
+    if (!studentSnap.empty) {
+      userDoc = studentSnap.docs[0];
+      userId = userDoc.id;
+      userCollection = "students";
+    }
+
+    // Check faculty
+    if (!userDoc) {
+      const facultySnap = await admin.firestore().collection("faculty")
+        .where("uid", "==", req.firebaseUid).limit(1).get();
+      if (!facultySnap.empty) {
+        userDoc = facultySnap.docs[0];
+        userId = userDoc.id;
+        userCollection = "faculty";
+      }
+    }
+
+    // Check parents
+    if (!userDoc) {
+      const parentSnap = await admin.firestore().collection("parents")
+        .where("uid", "==", req.firebaseUid).limit(1).get();
+      if (!parentSnap.empty) {
+        userDoc = parentSnap.docs[0];
+        userId = userDoc.id;
+        userCollection = "parents";
+      }
+    }
+
+    if (!userDoc) return res.status(404).json({ error: "User not found for this account" });
+    const studentId = userId;
+    const d = userDoc.data();
     // SERVER-SIDE limit enforcement: hard limit of 3 photo uploads per academic year
     // Academic year resets on August 1st each year
     const now = new Date();
@@ -7470,7 +7636,7 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
       photoUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     console.log("[BACKEND 10] Updating Firestore... photoChangeCount:", count);
-    await admin.firestore().collection("students").doc(studentId).update(updateData);
+    await admin.firestore().collection(userCollection).doc(studentId).update(updateData);
     console.log("[BACKEND 10] ✅ Firestore updated");
     console.log(`[BACKEND 11] ✅ SUCCESS. studentId=${studentId} count=${count}/3`);
     return res.json({
