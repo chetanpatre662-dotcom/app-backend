@@ -2106,8 +2106,11 @@ async function getAllDataWithPriorityEmit() {
   // Await the second source (won't throw — errors caught above)
   const second = first.source === "volty" ? await smlPromise : await voltyPromise;
 
-  // MERGED EMIT: combine both sources + stale cache
-  const combined = [...first.buses, ...second.buses];
+  // MERGED EMIT: combine both polled sources + recent push-based (Tata) buses.
+  // Tata is not polled here, so re-feed its recent state to keep it "fresh"
+  // in mergeBusCache (prevents it being purged after the stale timeout).
+  const tataBuses = getRecentTataBuses();
+  const combined = [...first.buses, ...second.buses, ...tataBuses];
   const T_merge_start = Date.now();
   allBuses = mergeBusCache(combined);
   latestBuses = allBuses;
@@ -3333,13 +3336,30 @@ function mergeBusCache(freshBuses) {
   const merged = [...freshBuses];
   for (const [busId, entry] of Object.entries(_lastKnownBuses)) {
     if (freshIds.has(busId)) continue;
+
+    // ── Tata push-based buses: NEVER purge by age ──────────────────────────
+    // Their last-known location persists indefinitely. Age is recomputed live
+    // from the real GPS event time so the displayed age keeps increasing.
+    // (Normally Tata buses are already in freshBuses via getRecentTataBuses(),
+    // so this is a defensive guard against ever deleting them.)
+    if (entry.data && entry.data.vendor === "tata") {
+      const gpsMs = Number(entry.data.gpsTimeMs) || Date.parse(entry.data.gpsTime) || now;
+      const liveAgeSec = Math.max(0, Math.round((now - gpsMs) / 1000));
+      merged.push({
+        ...entry.data,
+        gpsAgeSeconds: liveAgeSec,
+        gpsState: liveAgeSec <= 180 ? GPS_STATE.LIVE : liveAgeSec <= 300 ? GPS_STATE.UPDATING : GPS_STATE.OFFLINE,
+      });
+      continue;
+    }
+
     const age = now - entry.lastSeen;
     if (age > _BUS_STALE_TIMEOUT_MS) {
       delete _lastKnownBuses[busId];
       continue;
     }
-    // If lastSeen is very recent (<120s), the bus is live via push-based vendor
-    // (e.g., Tata). Preserve its actual data instead of marking stale.
+    // If lastSeen is very recent (<120s), the bus is live via push-based vendor.
+    // Preserve its actual data instead of marking stale.
     if (age < 120000) {
       merged.push(entry.data);
     } else {
@@ -3540,9 +3560,232 @@ setInterval(() => {
   }
 }, 60000); // Every 60 seconds
 
-/* =========================
-   WS CONNECTION
-========================= */
+/* ═══════════════════════════════════════════════════════════════════════════════
+   SUPPORT CHAT — WebSocket real-time delivery
+   Reuses the SAME wss server + SAME Firestore collections (support_tickets,
+   ticket_messages) as the existing POST/GET flow. Messages are still persisted
+   to the database (history preserved); WebSocket only adds instant delivery.
+   Security: sender identity is derived from the authenticated socket
+   (ws._firebaseUid / ws._isAdmin), NEVER from client-provided sender fields.
+═══════════════════════════════════════════════════════════════════════════════ */
+
+// Deliver a chat payload to every socket that has joined the given ticket room.
+function _deliverToTicketRoom(ticketId, payload, exceptWs = null) {
+  const str = JSON.stringify(payload);
+  let delivered = 0;
+  wss.clients.forEach((client) => {
+    if (client.readyState !== 1) return;
+    if (client === exceptWs) return;
+    if (client._ticketRooms && client._ticketRooms.has(String(ticketId))) {
+      try { client.send(str); delivered++; } catch (_) {}
+    }
+  });
+  return delivered;
+}
+
+// Verify ticket ownership for a NON-admin socket (mirrors the POST endpoint logic).
+async function _wsUserOwnsTicket(ticketData, firebaseUid) {
+  if (!firebaseUid) return false;
+  if (ticketData.userId === firebaseUid) return true;
+  const role = ticketData.role || "student";
+  const cols = { student: "students", parent: "parents", faculty: "faculty" };
+  const col = cols[role] || "students";
+  try {
+    const userDoc = await admin.firestore().collection(col).doc(ticketData.userId).get();
+    if (userDoc.exists) {
+      const storedUid = userDoc.data().uid;
+      if (storedUid === firebaseUid) return true;
+      if (!storedUid) {
+        const uidSnap = await admin.firestore().collection(col)
+          .where("uid", "==", firebaseUid).limit(1).get();
+        if (!uidSnap.empty && uidSnap.docs[0].id === ticketData.userId) return true;
+      }
+    }
+  } catch (_) {}
+  return false;
+}
+
+// Handle an incoming chat_message over WebSocket: authenticate, validate,
+// persist to DB, ACK the sender, and deliver to the ticket room in real time.
+async function handleWsChatMessage(ws, parsed) {
+  const ackFail = (reason, clientMessageId) => {
+    try { ws.send(JSON.stringify({ type: "chat_message_ack", success: false, error: reason, clientMessageId })); } catch (_) {}
+  };
+  try {
+    const ticketId = String(parsed.ticketId || parsed.conversationId || "");
+    const text = (parsed.text || parsed.message || "").toString();
+    const clientMessageId = parsed.clientMessageId || null;
+
+    if (!ws._authenticated) return ackFail("UNAUTHENTICATED", clientMessageId);
+    if (!ticketId) return ackFail("MISSING_CONVERSATION", clientMessageId);
+    if (!text.trim()) return ackFail("EMPTY_MESSAGE", clientMessageId);
+    if (text.length > 2000) return ackFail("MESSAGE_TOO_LONG", clientMessageId);
+
+    const ticketRef = admin.firestore().collection("support_tickets").doc(ticketId);
+    const ticketDoc = await ticketRef.get();
+    if (!ticketDoc.exists) return ackFail("TICKET_NOT_FOUND", clientMessageId);
+    const ticketData = ticketDoc.data();
+
+    // ── Server determines sender identity (never trust client) ──
+    const isAdmin = ws._isAdmin === true;
+    if (!isAdmin) {
+      const owns = await _wsUserOwnsTicket(ticketData, ws._firebaseUid);
+      if (!owns) return ackFail("ACCESS_DENIED", clientMessageId);
+    } else {
+      // Institution isolation for admins (mirrors POST endpoint)
+      if (ws._institution && ws._institution !== "all" &&
+          ticketData.institution && ticketData.institution !== ws._institution) {
+        return ackFail("WRONG_INSTITUTION", clientMessageId);
+      }
+    }
+    if (ticketData.status === "closed" && isAdmin) {
+      return ackFail("TICKET_CLOSED", clientMessageId);
+    }
+
+    const senderType = isAdmin ? "admin" : "user";
+    const senderId = isAdmin ? "admin" : (ticketData.userId || "");
+    const senderName = isAdmin ? "Admin" : (parsed.senderName ? sanitize(parsed.senderName) : (ticketData.userName || "Student"));
+    const cleanMsg = sanitize(text);
+
+    // ── Idempotency: if clientMessageId already stored, don't duplicate ──
+    if (clientMessageId) {
+      const dup = await admin.firestore().collection("ticket_messages")
+        .where("ticketId", "==", ticketId)
+        .where("clientMessageId", "==", clientMessageId)
+        .limit(1).get();
+      if (!dup.empty) {
+        const existing = dup.docs[0];
+        try { ws.send(JSON.stringify({ type: "chat_message_ack", success: true, messageId: existing.id, clientMessageId })); } catch (_) {}
+        return;
+      }
+    }
+
+    // ── Persist to DB + update ticket metadata (server timestamp = authoritative order) ──
+    const [msgRef] = await Promise.all([
+      admin.firestore().collection("ticket_messages").add({
+        ticketId,
+        senderType,
+        senderId,
+        senderName,
+        message: cleanMsg,
+        clientMessageId: clientMessageId || null,
+        isRead: false,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }),
+      ticketRef.update({
+        lastMessage: cleanMsg,
+        lastMessageBy: senderType,
+        lastMessageAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        messageCount: admin.firestore.FieldValue.increment(1),
+        ...(isAdmin ? { unreadUser: admin.firestore.FieldValue.increment(1), unreadAdmin: 0, status: ticketData.status === "closed" ? "closed" : "pending" }
+                    : { unreadAdmin: admin.firestore.FieldValue.increment(1), unreadUser: 0 }),
+      }),
+    ]);
+
+    const createdAtSeconds = Math.floor(Date.now() / 1000);
+    console.log(`[WS][CHAT] Message saved ticket=${ticketId} by=${senderType} id=${msgRef.id}`);
+
+    // ── ACK to sender ──
+    try {
+      ws.send(JSON.stringify({ type: "chat_message_ack", success: true, messageId: msgRef.id, clientMessageId, ticketId, createdAtSeconds }));
+    } catch (_) {}
+
+    // ── Deliver to everyone in the ticket room (users + admins), except sender ──
+    const deliveryPayload = {
+      type: "ticket_message",
+      ticketId,
+      messageId: msgRef.id,
+      senderType,
+      senderId,
+      senderName,
+      message: cleanMsg,
+      clientMessageId: clientMessageId || null,
+      createdAtSeconds,
+    };
+    const delivered = _deliverToTicketRoom(ticketId, deliveryPayload, ws);
+    // Also broadcast a lightweight ticket-list refresh signal to admins not in the room
+    const listSignal = JSON.stringify({ type: "ticket:unread", ticketId });
+    wss.clients.forEach((c) => {
+      if (c.readyState !== 1 || c === ws) return;
+      if (c._isAdmin && !(c._ticketRooms && c._ticketRooms.has(ticketId))) {
+        try { c.send(listSignal); } catch (_) {}
+      }
+    });
+    console.log(`[WS][CHAT] Message delivered ticket=${ticketId} to ${delivered} room client(s)`);
+
+    // ── Offline recipient: send FCM push for admin→user replies (fire-and-forget) ──
+    if (isAdmin) {
+      createUserNotification(ticketData.userId, "ticket_reply",
+        "Admin replied to your ticket", cleanMsg.substring(0, 100),
+        { ticketId, ticketNumber: ticketData.ticketNumber || "" });
+      (async () => {
+        try {
+          const role = ticketData.role || "student";
+          const cols = { student: "students", parent: "parents", faculty: "faculty" };
+          const col = cols[role] || "students";
+          const userDoc = await admin.firestore().collection(col).doc(ticketData.userId).get();
+          if (userDoc.exists) {
+            const fcmToken = userDoc.data().fcmToken;
+            if (fcmToken && fcmToken.length > 10) {
+              await admin.messaging().send({
+                token: fcmToken,
+                notification: { title: "Support Reply", body: cleanMsg.substring(0, 100) },
+                data: { type: "ticket_reply", ticketId, ticketNumber: ticketData.ticketNumber || "" },
+              });
+            }
+          }
+        } catch (_) {}
+      })();
+    }
+  } catch (e) {
+    console.log(`[WS][CHAT] Error: ${e.message}`);
+    ackFail("SERVER_ERROR", parsed && parsed.clientMessageId);
+  }
+}
+
+// Handle read receipts: mark messages read in DB and notify the other side.
+async function handleWsChatRead(ws, parsed) {
+  try {
+    if (!ws._authenticated) return;
+    const ticketId = String(parsed.ticketId || parsed.conversationId || "");
+    if (!ticketId) return;
+    const ticketRef = admin.firestore().collection("support_tickets").doc(ticketId);
+    const ticketDoc = await ticketRef.get();
+    if (!ticketDoc.exists) return;
+    const ticketData = ticketDoc.data();
+    const isAdmin = ws._isAdmin === true;
+    if (!isAdmin) {
+      const owns = await _wsUserOwnsTicket(ticketData, ws._firebaseUid);
+      if (!owns) return;
+    }
+    // Admin reading → clear admin unread + mark user messages read.
+    // User reading → clear user unread.
+    if (isAdmin) {
+      const snap = await admin.firestore().collection("ticket_messages")
+        .where("ticketId", "==", ticketId).where("senderType", "==", "user").where("isRead", "==", false).get();
+      const batch = admin.firestore().batch();
+      snap.docs.forEach(d => batch.update(d.ref, { isRead: true }));
+      if (!snap.empty) await batch.commit();
+      await ticketRef.update({ unreadAdmin: 0 });
+    } else {
+      await ticketRef.update({ unreadUser: 0 });
+    }
+    // Notify the other side that messages were seen
+    _deliverToTicketRoom(ticketId, { type: "ticket:seen", ticketId, senderType: isAdmin ? "admin" : "user" }, ws);
+  } catch (e) {
+    console.log(`[WS][CHAT] Read error: ${e.message}`);
+  }
+}
+
+// Relay typing indicators to the ticket room (no DB write).
+function handleWsChatTyping(ws, parsed) {
+  if (!ws._authenticated) return;
+  const ticketId = String(parsed.ticketId || parsed.conversationId || "");
+  if (!ticketId) return;
+  const senderType = ws._isAdmin ? "admin" : "user";
+  _deliverToTicketRoom(ticketId, { type: "ticket:typing", ticketId, senderType }, ws);
+}
 
 /* =========================
    WS CONNECTION
@@ -3602,6 +3845,31 @@ wss.on("connection", (ws, req) => {
             ws.send(JSON.stringify({ type: "init", data: filtered }));
           }
         }
+        return;
+      }
+
+      // ── SUPPORT CHAT: real-time message types ──────────────────────────
+      // ws._ticketRooms tracks which ticket conversations this socket follows.
+      if (parsed.type === "ticket:join" && parsed.ticketId) {
+        ws._ticketRooms = ws._ticketRooms || new Set();
+        ws._ticketRooms.add(String(parsed.ticketId));
+        return;
+      }
+      if (parsed.type === "ticket:leave" && parsed.ticketId) {
+        if (ws._ticketRooms) ws._ticketRooms.delete(String(parsed.ticketId));
+        return;
+      }
+      if (parsed.type === "chat_message") {
+        handleWsChatMessage(ws, parsed);
+        return;
+      }
+      if (parsed.type === "chat_read" || parsed.type === "ticket:seen") {
+        handleWsChatRead(ws, parsed);
+        return;
+      }
+      if (parsed.type === "ticket:typing") {
+        handleWsChatTyping(ws, parsed);
+        return;
       }
     } catch (_) {}
   });
@@ -3853,6 +4121,43 @@ app.get("/api/rto-mapping", async (req, res) => {
    ========================================================================== */
 const _tataLatestState = {}; // IMEI → { receivedAt, payload, normalizedBus }
 
+// ── Tata last-known persistence ──────────────────────────────────────────────
+// Tata is a PUSH-based vendor: the device only reports when it has an update
+// (idle/parked vehicles report infrequently or not at all). The main polling
+// loop (Voltysoft/SML) does NOT fetch Tata, so the periodic broadcast would
+// otherwise omit Tata buses and mergeBusCache would purge them after 5 min.
+//
+// REQUIREMENT: A Tata vehicle's LAST-KNOWN location must persist INDEFINITELY —
+// it is NEVER deleted based on age. Only the DATA AGE increases over time and
+// is shown to the user (via gpsAgeSeconds/gpsState). There is no arbitrary
+// expiry window. We re-feed every stored Tata bus into the periodic broadcast
+// on each loop, with its age RECOMPUTED LIVE from the real GPS event timestamp
+// (we never fake freshness — the GPS timestamp stays the original one).
+
+/**
+ * Returns ALL stored Tata buses (no expiry), each with gpsAgeSeconds/gpsState
+ * recomputed live from the real GPS event time. This keeps push-based buses
+ * permanently present in the broadcast/init payload while the displayed age
+ * continuously increases until a newer Tata push arrives.
+ */
+function getRecentTataBuses() {
+  const now = Date.now();
+  const out = [];
+  for (const entry of Object.values(_tataLatestState)) {
+    if (!entry || !entry.normalizedBus) continue;
+    const nb = entry.normalizedBus;
+    // Recompute live age from the REAL GPS event time (never faked).
+    const gpsMs = Number(nb.gpsTimeMs) || Date.parse(nb.gpsTime) || now;
+    const liveAgeSec = Math.max(0, Math.round((now - gpsMs) / 1000));
+    out.push({
+      ...nb,
+      gpsAgeSeconds: liveAgeSec,
+      gpsState: liveAgeSec <= 180 ? "LIVE" : liveAgeSec <= 300 ? "UPDATING" : "OFFLINE",
+    });
+  }
+  return out;
+}
+
 app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, res) => {
   try {
     // Parse payload (Buffer or pre-parsed object)
@@ -3970,6 +4275,11 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
         gpsState: gpsAgeSeconds <= 180 ? "LIVE" : gpsAgeSeconds <= 300 ? "UPDATING" : "OFFLINE",
         lastGpsUpdateUtc: gpsTime,
         lastGpsUpdateIst: gpsIst,
+        // ── Tata push-based vendor tags ──────────────────────────────────
+        // vendor="tata" tells mergeBusCache to NEVER purge this bus by age and
+        // to recompute its age live from the real GPS event time (gpsTimeMs).
+        vendor: "tata",
+        gpsTimeMs, // real GPS event epoch ms — source of truth for age
       };
 
       // Upsert: store latest state by IMEI (replaces previous for same IMEI)
@@ -3992,12 +4302,19 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
       processed++;
     }
 
-    // Broadcast once after all vehicles processed (single WebSocket emission)
+    // Broadcast once after all vehicles processed (single WebSocket emission).
+    // Include: non-Tata cached buses still within the stale window +
+    // ALL Tata buses (last-known persists indefinitely, age recomputed live).
     if (processed > 0) {
-      const allCachedBuses = Object.values(_lastKnownBuses)
-        .filter(e => (Date.now() - e.lastSeen) < _BUS_STALE_TIMEOUT_MS)
+      const nowMs = Date.now();
+      const nonTataCached = Object.values(_lastKnownBuses)
+        .filter(e => e.data && e.data.vendor !== "tata" && (nowMs - e.lastSeen) < _BUS_STALE_TIMEOUT_MS)
         .map(e => e.data);
+      const allTataBuses = getRecentTataBuses(); // every stored Tata bus, live age
+      const allCachedBuses = [...nonTataCached, ...allTataBuses];
       latestBuses = allCachedBuses;
+      const wsClientCount = (typeof wss !== "undefined" && wss.clients) ? wss.clients.size : 0;
+      console.log(`[WS][TATA] Broadcasting ${allCachedBuses.length} buses (incl. ${processedBuses.join(",")}) to ${wsClientCount} WS clients`);
       broadcast(allCachedBuses);
     }
 
@@ -5375,9 +5692,17 @@ app.post("/api/tickets", ticketLimiter, authenticateFirebaseUser, async (req, re
       status: "open",
     });
 
-    // WebSocket broadcast
+    // WebSocket broadcast — include full message for direct append
     try {
-      const wsPayload = JSON.stringify({ type: "ticket_message", ticketId, senderType: "user" });
+      const wsPayload = JSON.stringify({
+        type: "ticket_message",
+        ticketId,
+        senderType: "user",
+        message: cleanMessage,
+        senderId: userId,
+        senderName: sanitize(userDoc.name || ""),
+        createdAtSeconds: Math.floor(Date.now() / 1000),
+      });
       wss.clients.forEach((c) => { if (c.readyState === 1) try { c.send(wsPayload); } catch (_) {} });
     } catch (_) {}
 
@@ -5569,6 +5894,8 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
     const _t4 = Date.now();
 
     // ── Broadcast ticket update via WebSocket for instant delivery ──
+    // Payload includes the FULL message so clients can append directly
+    // without a follow-up HTTP fetch (much faster, fewer reads).
     const _t5 = Date.now();
     try {
       const wsPayload = JSON.stringify({
@@ -5576,6 +5903,10 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
         ticketId,
         senderType: senderType || "user",
         messageId: msgRef.id,
+        message: cleanMsg,
+        senderId: senderId || "",
+        senderName: sanitize(senderName || ""),
+        createdAtSeconds: Math.floor(Date.now() / 1000),
       });
       wss.clients.forEach((client) => {
         if (client.readyState === 1) {
