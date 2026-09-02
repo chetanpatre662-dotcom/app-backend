@@ -36,9 +36,11 @@ function fromStr(value) {
 
 async function set(key, value, options = null) {
   await connectRedis();
-  if (options?.EX) {
-    // Atomic set + expire in one command
-    return client.set(key, toStr(value), { EX: options.EX });
+  const opts = {};
+  if (options?.EX) opts.EX = options.EX;
+  if (options?.NX) opts.NX = true;   // atomic "only set if not exists" support
+  if (Object.keys(opts).length > 0) {
+    return client.set(key, toStr(value), opts);
   }
   return client.set(key, toStr(value));
 }

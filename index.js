@@ -348,7 +348,7 @@ app.use(apiLimiter);
 app.use((req, res, next) => {
   if (req.path.startsWith("/api/") && !req.path.startsWith("/api/tickets") && 
       !req.path.startsWith("/api/bus-pass") && !req.path.startsWith("/api/notifications") &&
-      !req.path.startsWith("/api/tracking")) {
+      !req.path.startsWith("/api/tracking") && !req.path.startsWith("/api/support")) {
     req.url = req.url.replace(/^\/api/, "");
   }
   next();
@@ -3098,100 +3098,299 @@ async function handleBus(bus, students) {
     await redis.setEx(`busState:${busId}`, 86400, newState);
   }
 
-  // ── Nearby notifications: per-user, fully Redis-deduped ──────────────────
-  // Fire whenever the bus is moving (speed >= 5) regardless of tripActive flag,
-  // because tripActive may not be set yet on very early GPS fixes.
-  if (bus.speed >= 5) {
-    const busUsers = students.filter((s) => {
-      if (!s.fcmToken) return false;
-      // Normalise stored busId to "BUS-X" format before comparing
-      const storedBus = String(s.busId || "").trim().toUpperCase().replace(/\s+/g, "-");
-      const liveBus   = String(busId     || "").trim().toUpperCase().replace(/\s+/g, "-");
-      return storedBus === liveBus;
-    });
+  // ── Route/stop-based proximity notifications ─────────────────────────────
+  // Replaced the old student-GPS-dependent 5 km nearby notification with a
+  // route-stop engine that does NOT require the student's live location.
+  // Any student enrolled on this bus receives a notification when the bus
+  // reaches the stop that is exactly 2 positions before their enrolled city
+  // in the current travel direction.
+  await handleStopNotifications(bus, students);
+}
 
-    // [DIAG] Log entry into notification block (once per bus per loop)
-    if (busUsers.length > 0) {
-      console.log(`[NOTIF-DIAG] ${busId} speed=${bus.speed} eligible_users=${busUsers.length} ids=[${busUsers.slice(0,3).map(u=>u.studentId).join(",")}]`);
+/* =============================================================================
+   STOP-PROXIMITY NOTIFICATION ENGINE  (v2)
+   ─────────────────────────────────────────────────────────────────────────────
+   Fixes applied in v2:
+   1. FCM failure does NOT permanently consume the notification.
+      Per-recipient keys track individual delivery; a failed send is retryable
+      on the next GPS update.  A group-level "pending" key prevents concurrent
+      duplicate sends from racing GPS packets while still allowing retries after
+      genuine failures.
+
+   2. Direction must be CONFIRMED before any notification fires.
+      The function checks busRouteState[busId]?.isForward; if undefined (not yet
+      seeded by the direction engine) the call is skipped.  No ?? true default.
+
+   3. Multi-route: if a bus serves both college and school students, each
+      institution group is evaluated against its own route graph.  Students are
+      never evaluated against the wrong route.
+
+   Dedup key schema:
+     Group lock:
+       notif:stop:lock:{busId}:{tripId}:{safeTriggerId}:{safeStudentId}
+       → Set to "pending" while sending, "done" when ≥1 FCM succeeds.
+       → "pending" prevents concurrent duplicate fires; retried if FCM all fail.
+     Per-recipient delivery record:
+       notif:stop:rcpt:{tokenHash}:{tripId}:{safeTriggerId}:{safeStudentId}
+       → Set after individual FCM succeeds; prevents re-sending to that token.
+       → Separate from the group lock so partial success is handled correctly.
+============================================================================= */
+const STOP_NOTIF_RADIUS_KM   = 0.2;        // 200 m trigger radius
+const STOP_NOTIF_STEPS_BACK  = 2;          // notify N stops before enrolled stop
+const STOP_NOTIF_LOCK_TTL    = 5 * 60;     // 5 min — "pending" lock window
+const STOP_NOTIF_DONE_TTL    = 12 * 3600;  // 12 h — "done" / per-recipient TTL
+const STOP_NOTIF_PENDING     = "pending";
+const STOP_NOTIF_DONE        = "done";
+
+/**
+ * Short stable hash of an FCM token for use in Redis keys.
+ * We never store the token in a key (tokens are long/opaque); a 10-char hex
+ * prefix of its SHA-256 is enough to distinguish recipients within a trip.
+ */
+function _tokenHash(token) {
+  return require("crypto").createHash("sha256").update(token).digest("hex").slice(0, 10);
+}
+
+/**
+ * Core stop-notification engine.  Called from handleBus() on every GPS update.
+ *
+ * @param {object} bus      — normalised bus object (.busId, .lat, .lng, .speed)
+ * @param {Array}  students — in-memory student cache (Firestore onSnapshot)
+ */
+async function handleStopNotifications(bus, students) {
+  const busId = bus.busId;
+
+  // Guard 1: valid GPS
+  if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng)) return;
+
+  // Guard 2: active trip required — no positioning / depot movement noise
+  const tripState = tripStatusMap[busId];
+  const tripId    = tripState?.currentTripId;
+  if (!tripId) return;
+
+  // Guard 3: bus must be moving
+  if (bus.speed < 5) return;
+
+  // Guard 4: direction must be CONFIRMED by the existing direction engine.
+  // busRouteState[busId] is seeded/updated by getRouteInfo() which runs in
+  // formatBuses / formatSMLBuses / tata-push BEFORE handleBus is called.
+  // If isForward is still undefined (engine hasn't seen enough GPS history),
+  // skip — better to delay one notification than send it to the wrong stop.
+  const dirState = busRouteState[busId];
+  if (!dirState || dirState.isForward === undefined || dirState.isForward === null) {
+    // Log once per bus until direction is known (only while bus is active)
+    console.log(`[STOP-NOTIF] bus=${busId} SKIP_NO_DIRECTION — waiting for GPS direction engine`);
+    return;
+  }
+  const isForward = dirState.isForward;
+
+  // Normalise busId for comparison (same convention as rest of codebase)
+  const liveBusNorm = String(busId || "").trim().toUpperCase().replace(/\s+/g, "-");
+
+  // ── Group students by institution so each group is evaluated against its
+  //    own route graph.  A bus may have a college route AND a school route;
+  //    evaluating school students against the college route (or vice-versa)
+  //    would calculate the wrong trigger stop.
+  // ──────────────────────────────────────────────────────────────────────────
+  const institutionGroups = new Map(); // routeType string → student[]
+  for (const s of students) {
+    if (!s.fcmToken || !s.city) continue;
+    const storedBusNorm = String(s.busId || "").trim().toUpperCase().replace(/\s+/g, "-");
+    if (storedBusNorm !== liveBusNorm) continue;
+    // Resolve institution: student.institution > student.studentType > "college"
+    const inst = (
+      (s.institution || "").toLowerCase() ||
+      (s.studentType  || "").toLowerCase() ||
+      "college"
+    );
+    const key = (inst === "school") ? "school" : "college"; // normalise to two known types
+    if (!institutionGroups.has(key)) institutionGroups.set(key, []);
+    institutionGroups.get(key).push(s);
+  }
+
+  if (institutionGroups.size === 0) return;
+
+  // Process each institution group with its own route graph
+  for (const [routeType, groupStudents] of institutionGroups) {
+
+    // Fetch institution-specific route graph (in-memory cached after first call)
+    const routeDoc = await _fetchRouteForInstitution(busId, routeType);
+    if (!routeDoc) continue;
+    const routeGraph = buildRouteGraph(routeDoc);
+    if (!routeGraph?.merged?.length) continue;
+    const stops = routeGraph.merged; // ordered city[] with .name, .lat, .lng
+
+    // Collect unique enrolled-stop names for this institution group
+    const enrolledStops = new Set();
+    for (const s of groupStudents) {
+      enrolledStops.add(s.city.trim().toLowerCase());
     }
 
-    if (busUsers.length > 0) {
-      // ── BATCH: Pre-fetch all student locations concurrently ──────────────
-      const userLocs = await Promise.all(
-        busUsers.map((u) => u.studentId ? getStudentLocation(u.studentId) : null)
+    for (const enrolledCityLower of enrolledStops) {
+
+      // ── Find enrolled stop in route ──────────────────────────────────────
+      // stops[] is ordered by polyline position (sequence-stable).
+      // Forward direction = bus travels from stops[0] toward stops[n-1];
+      // index increases as bus moves forward along the route.
+      const enrolledIdx = stops.findIndex(
+        (c) => (c.name || "").trim().toLowerCase() === enrolledCityLower
       );
-
-      for (let i = 0; i < busUsers.length; i++) {
-        const user = busUsers[i];
-        if (!user.fcmToken || !user.studentId) continue;
-
-        const loc = userLocs[i];
-        if (!loc?.lat || !loc?.lng) {
-          console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} SKIP: no Redis location`);
-          continue;
-        }
-
-      // [DIAG] Log staleness of student location
-      const locAgeMs = loc.lastUpdated ? (Date.now() - loc.lastUpdated) : -1;
-      console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} loc_age=${Math.round(locAgeMs/1000)}s lat=${loc.lat?.toFixed(4)} lng=${loc.lng?.toFixed(4)}`);
-
-      if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng) ||
-          !Number.isFinite(loc.lat) || !Number.isFinite(loc.lng)) continue;
-
-      const dist = calculateDistance(bus.lat, bus.lng, loc.lat, loc.lng);
-      if (!Number.isFinite(dist)) continue;
-
-      const nearbyKey = `notif:nearby:${user.studentId}:${busId}:${today}`;
-
-      console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} dist=${dist.toFixed(2)}km key=${nearbyKey}`);
-
-      if (dist > 8) {
-        // Bus moved away — delete dedup flag so it can fire again next approach.
-        await redis.del(nearbyKey);
+      if (enrolledIdx === -1) {
+        console.log(`[STOP-NOTIF] bus=${busId} route=${routeType} SKIP_STOP_NOT_FOUND student_stop="${enrolledCityLower}"`);
         continue;
       }
 
-      if (dist <= 5 && dist > 0.1) {
-        const alreadySent = await redis.get(nearbyKey);
-        console.log(`[NOTIF-DIAG] ${busId} → ${user.studentId} IN_RANGE dist=${dist.toFixed(2)}km alreadySent=${!!alreadySent}`);
-        if (!alreadySent) {
-          // Set BEFORE sending to prevent race-condition duplicates
-          await redis.setEx(nearbyKey, 4 * 3600, "1"); // TTL 4h resets daily
+      // ── Calculate trigger-stop index ─────────────────────────────────────
+      // Forward (index increases in travel direction):
+      //   bus approaches enrolled stop from LOWER index → trigger = idx - 2
+      //   Example: enrolled=stops[4] (idx=4) → trigger=stops[2] (idx=2)
+      //
+      // Reverse (index decreases in travel direction):
+      //   bus approaches enrolled stop from HIGHER index → trigger = idx + 2
+      //   Example: enrolled=stops[4] (idx=4) → trigger=stops[6] (idx=6)
+      const triggerIdx = isForward
+        ? enrolledIdx - STOP_NOTIF_STEPS_BACK
+        : enrolledIdx + STOP_NOTIF_STEPS_BACK;
 
-          try {
-            const fcmResult = await admin.messaging().send({
-              token: user.fcmToken,
-              notification: {
-                title: "🚌 Bus is Nearby!",
-                body:  `${busId} is within 5 km — get ready to board.`,
-              },
-              data: {
-                type:      "bus_nearby",
-                busId,
-                studentId: user.studentId,
-                distance:  dist.toFixed(1),
-              },
-              android: { priority: "high", notification: { channelId: "bus_channel" } },
-            });
-            console.log(`✅ Nearby → ${user.studentId} (${dist.toFixed(1)} km) FCM_ID=${fcmResult}`);
-          } catch (e) {
-            if (e.code === "messaging/registration-token-not-registered" || e.code === "messaging/invalid-registration-token") {
-              _pruneInvalidToken(user.fcmToken, user.studentId, "students");
-            }
-            console.log(`❌ FCM nearby FAILED (${user.studentId}): code=${e.code} msg=${e.message}`);
+      // Guard: trigger index out of route bounds → no notification (edge case B)
+      if (triggerIdx < 0 || triggerIdx >= stops.length) continue;
+
+      const triggerStop = stops[triggerIdx];
+
+      // Guard: trigger stop coordinates valid (edge case E)
+      if (!Number.isFinite(triggerStop.lat) || !Number.isFinite(triggerStop.lng)) continue;
+
+      // ── 200 m geofence: bus GPS → trigger-stop GPS ───────────────────────
+      // Student GPS is NEVER used here.
+      const distKm = calculateDistance(bus.lat, bus.lng, triggerStop.lat, triggerStop.lng);
+      if (!Number.isFinite(distKm) || distKm > STOP_NOTIF_RADIUS_KM) continue;
+
+      // ── Build stable Redis key fragments ─────────────────────────────────
+      const safeTriggerId = triggerStop.name.replace(/[^A-Za-z0-9]/g, "_");
+      const safeStudentId = enrolledCityLower.replace(/[^A-Za-z0-9]/g, "_");
+      const lockKey       = `notif:stop:lock:${busId}:${tripId}:${safeTriggerId}:${safeStudentId}`;
+
+      // ── Group-level lock check ────────────────────────────────────────────
+      // Values:
+      //   undefined/"none" → not yet attempted this trip
+      //   STOP_NOTIF_PENDING ("pending") → a concurrent GPS packet is sending
+      //   STOP_NOTIF_DONE   ("done")     → at least one FCM succeeded; all
+      //                                    recipients individually tracked
+      const lockVal = await redis.get(lockKey);
+
+      if (lockVal === STOP_NOTIF_DONE) continue; // fully delivered, skip
+
+      if (lockVal === STOP_NOTIF_PENDING) {
+        // Another GPS packet is mid-send for this stop/trip combo.
+        // Skip to avoid duplicates; if that attempt fails, the lock TTL (5 min)
+        // will expire and the next GPS packet will retry.
+        continue;
+      }
+
+      // ── Collect recipients for this stop ──────────────────────────────────
+      const recipients = groupStudents.filter(
+        (s) => s.fcmToken && s.city &&
+               s.city.trim().toLowerCase() === enrolledCityLower
+      );
+      if (recipients.length === 0) continue;
+
+      // ── Acquire group lock (prevent concurrent races) ─────────────────────
+      // NX = only set if key does NOT exist (atomic)
+      const acquired = await redis.set(lockKey, STOP_NOTIF_PENDING, {
+        NX: true,
+        EX: STOP_NOTIF_LOCK_TTL,
+      });
+      // acquired === "OK" means we won the lock; null means another process beat us
+      if (!acquired) continue; // lost the race — other process is sending
+
+      const enrolledStopDisplay = stops[enrolledIdx].name;
+      const direction = isForward
+        ? `${stops[0].name} → ${stops[stops.length - 1].name}`
+        : `${stops[stops.length - 1].name} → ${stops[0].name}`;
+      const notifTitle = "🚌 Bus Alert";
+      const notifBody  = sanitize(
+        `Your bus has reached ${triggerStop.name}. ` +
+        `${enrolledStopDisplay} is ${STOP_NOTIF_STEPS_BACK} stops away. Please get ready.`
+      );
+
+      console.log(
+        `[STOP-NOTIF] bus=${busId} route=${routeType} dir=${isForward ? "forward" : "reverse"}` +
+        ` student_stop="${enrolledStopDisplay}" trigger_stop="${triggerStop.name}"` +
+        ` dist=${(distKm * 1000).toFixed(0)}m recipients=${recipients.length} action=SEND`
+      );
+
+      let sent = 0;
+      let anySuccess = false;
+
+      for (const user of recipients) {
+        // ── Per-recipient skip: already delivered to this token this trip ──
+        const rcptKey = `notif:stop:rcpt:${_tokenHash(user.fcmToken)}:${tripId}:${safeTriggerId}:${safeStudentId}`;
+        const rcptDone = await redis.get(rcptKey);
+        if (rcptDone) {
+          sent++; // count as delivered (no re-send needed)
+          anySuccess = true;
+          continue;
+        }
+
+        try {
+          await admin.messaging().send({
+            token: user.fcmToken,
+            notification: { title: notifTitle, body: notifBody },
+            data: {
+              type:        "bus_stop_alert",
+              busId,
+              tripId,
+              triggerStop: triggerStop.name,
+              studentStop: enrolledStopDisplay,
+              stopsAway:   String(STOP_NOTIF_STEPS_BACK),
+              direction,
+              routeType,
+            },
+            android: { priority: "high", notification: { channelId: "bus_channel" } },
+          });
+
+          // Mark this token as delivered — prevents re-send even if group lock
+          // somehow expires and another GPS update re-enters for this trip.
+          await redis.setEx(rcptKey, STOP_NOTIF_DONE_TTL, "1");
+          sent++;
+          anySuccess = true;
+
+        } catch (e) {
+          if (
+            e.code === "messaging/registration-token-not-registered" ||
+            e.code === "messaging/invalid-registration-token"
+          ) {
+            // Invalid token — prune it and mark as done (no point retrying)
+            _pruneInvalidToken(user.fcmToken, user.studentId, "students");
+            await redis.setEx(rcptKey, STOP_NOTIF_DONE_TTL, "pruned");
+            anySuccess = true; // treat as "done" for this recipient
+          } else {
+            // Transient failure — do NOT set rcptKey; allow retry on next GPS update
+            console.log(`[STOP-NOTIF] FCM transient fail ${user.studentId}: ${e.message}`);
           }
         }
       }
-    }
-    } // close if (busUsers.length > 0)
-  } else {
-    // [DIAG] Bus speed too low to enter notification block
-    if (bus.speed > 0) {
-      // Only log once when speed is between 1-4 (avoid spam for parked buses)
-      // Actually skip this to avoid log spam — only log when speed >= 5 above
+
+      // ── Update group lock based on outcome ───────────────────────────────
+      if (anySuccess) {
+        // At least one recipient delivered (or pruned). Promote lock to "done"
+        // with full 12 h TTL to suppress future group-level re-evaluations.
+        await redis.setEx(lockKey, STOP_NOTIF_DONE_TTL, STOP_NOTIF_DONE);
+      } else {
+        // All FCM sends failed transiently. Release the pending lock (delete it)
+        // so the next GPS update can retry the entire group.
+        await redis.del(lockKey);
+      }
+
+      console.log(
+        `[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}"` +
+        ` student_stop="${enrolledStopDisplay}" sent=${sent}/${recipients.length}` +
+        ` anySuccess=${anySuccess}`
+      );
     }
   }
 }
+
 /* =========================
    USERS CACHE — Firestore onSnapshot Incremental Listeners
    Replaces polling with realtime listeners for 99.97% Firestore read reduction.
@@ -5757,6 +5956,74 @@ app.get("/api/tickets/user/:userId", authenticateFirebaseUser, async (req, res) 
   }
 });
 
+// GET /api/support/bootstrap — First-open fast path for the user chat.
+// Returns the user's active/latest ticket AND its messages in ONE round-trip,
+// collapsing the previous two sequential GETs (ticket lookup + message history)
+// into a single request. Creates NOTHING — a ticket is still only created when
+// the user actually sends their first message (via POST /api/tickets).
+//
+// Response:
+//   { success: true, ticket: {...}|null, messages: [...] }
+// Ownership is enforced exactly like GET /api/tickets/user/:userId — the caller
+// only ever receives their own ticket/messages.
+app.get("/api/support/bootstrap", authenticateFirebaseUser, async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "");
+    if (!userId) return res.status(400).json({ success: false, error: "Missing userId" });
+
+    // ── Ownership check (same strategy as /api/tickets/user/:userId) ──
+    let isOwner = req.firebaseUid === userId;
+    if (!isOwner) {
+      const cols = ["students", "parents", "faculty"];
+      for (const col of cols) {
+        const userDoc = await admin.firestore().collection(col).doc(userId).get();
+        if (userDoc.exists) {
+          const storedUid = userDoc.data().uid;
+          if (storedUid === req.firebaseUid) { isOwner = true; break; }
+          if (!storedUid) {
+            const uidSnap = await admin.firestore().collection(col)
+              .where("uid", "==", req.firebaseUid).limit(1).get();
+            if (!uidSnap.empty && uidSnap.docs[0].id === userId) { isOwner = true; break; }
+          }
+        }
+      }
+    }
+    if (!isOwner) return res.status(403).json({ success: false, error: "Access denied" });
+
+    // ── Resolve the active/latest ticket for this user ──
+    const snap = await admin.firestore().collection("support_tickets")
+      .where("userId", "==", userId)
+      .get();
+    if (snap.empty) {
+      // Brand-new user — no ticket yet. Nothing to create.
+      return res.json({ success: true, ticket: null, messages: [] });
+    }
+    const tickets = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => {
+        const ta = a.updatedAt?._seconds || a.updatedAt?.seconds || 0;
+        const tb = b.updatedAt?._seconds || b.updatedAt?.seconds || 0;
+        return tb - ta; // DESC
+      });
+    const active = tickets.find(t => t.status === "open" || t.status === "pending") || tickets[0];
+
+    // ── Fetch that ticket's messages (single ticket → one query) ──
+    const msgSnap = await admin.firestore().collection("ticket_messages")
+      .where("ticketId", "==", active.id)
+      .get();
+    const messages = msgSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .sort((a, b) => {
+        const ta = a.createdAt?._seconds || a.createdAt?.seconds || 0;
+        const tb = b.createdAt?._seconds || b.createdAt?.seconds || 0;
+        return ta - tb; // ASC (oldest first)
+      });
+
+    return res.json({ success: true, ticket: active, messages });
+  } catch (e) {
+    console.log("[SUPPORT BOOTSTRAP] Error:", e.message);
+    return res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // GET /api/tickets/:ticketId/messages — Get all messages for a ticket
 app.get("/api/tickets/:ticketId/messages", authenticateAny, async (req, res) => {
   try {
@@ -7170,12 +7437,20 @@ app.post("/api/bus-pass/revoke/:studentId", busPassAuth, async (req, res) => {
 // - Guarantees ONE ROLL NUMBER = ONE USER globally.
 // - Handles releasing old roll number when a student changes theirs.
 // Returns: { success: true } or throws an error string.
-async function claimRollNumberAtomic(studentId, newRollRaw, oldRollRaw) {
+// options:
+//   enforceOneTime (bool) — if true, the transaction rejects the change when the
+//                           student doc already has rollNumberChangeUsed === true.
+//                           Used for the STUDENT self-service path only.
+//   markUsed       (bool) — if true, sets rollNumberChangeUsed = true on the
+//                           student doc in the SAME transaction as the roll update.
+//                           Admin path passes false so admins are never restricted.
+async function claimRollNumberAtomic(studentId, newRollRaw, oldRollRaw, options = {}) {
   const db = admin.firestore();
+  const { enforceOneTime = false, markUsed = false } = options;
   const newRoll = (newRollRaw || "").trim().toUpperCase();
   const oldRoll = (oldRollRaw || "").trim().toUpperCase();
 
-  // Same roll (no-op)
+  // Same roll (no-op) — never consumes the one-time change.
   if (newRoll === oldRoll) return { success: true, rollNumber: newRoll };
 
   // Clearing roll number — just release old claim
@@ -7198,6 +7473,19 @@ async function claimRollNumberAtomic(studentId, newRollRaw, oldRollRaw) {
 
   // Claim new roll number atomically
   await db.runTransaction(async (t) => {
+    const studentRef = db.collection("students").doc(studentId);
+
+    // ── One-time restriction (student path only) ──
+    // Re-read inside the transaction so a student cannot bypass the limit via
+    // rapid/concurrent requests or by clearing local storage. This is the
+    // authoritative check; the pre-transaction check is just for a fast error.
+    if (enforceOneTime) {
+      const sDoc = await t.get(studentRef);
+      if (sDoc.exists && sDoc.data().rollNumberChangeUsed === true) {
+        throw new Error("ROLL_CHANGE_USED");
+      }
+    }
+
     const regRef = db.collection("rollNumberRegistry").doc(newRoll);
     const regDoc = await t.get(regRef);
 
@@ -7234,9 +7522,16 @@ async function claimRollNumberAtomic(studentId, newRollRaw, oldRollRaw) {
     // Claim the new roll in registry
     t.set(regRef, { studentId, claimedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-    // Update student document
-    const studentRef = db.collection("students").doc(studentId);
-    t.update(studentRef, { rollNumber: newRoll });
+    // Update student document. When markUsed is set (student self-service path),
+    // permanently record that the one-time change has been consumed — in the
+    // SAME transaction as the roll update so the two can never diverge.
+    const studentUpdate = { rollNumber: newRoll };
+    if (markUsed) {
+      studentUpdate.rollNumberChangeUsed = true;
+      studentUpdate.rollNumberChangedAt =
+        admin.firestore.FieldValue.serverTimestamp();
+    }
+    t.update(studentRef, studentUpdate);
   });
 
   return { success: true, rollNumber: newRoll };
@@ -7268,14 +7563,45 @@ app.post("/student/claim-roll-number", authenticateFirebaseUser, async (req, res
     const oldRoll = currentData.rollNumber || "";
     console.log(`[ROLL][BACKEND] studentId=${studentId} oldRoll=${oldRoll}`);
 
+    // ── One-time restriction (fast pre-check) ──
+    // A student may change their roll number only ONCE. After that, only an
+    // admin can change it. The authoritative check also runs inside the
+    // transaction (see claimRollNumberAtomic) to prevent race/bypass. A no-op
+    // (same roll) is allowed through and simply short-circuits.
+    const alreadyUsed = currentData.rollNumberChangeUsed === true;
+    const isActualChange =
+      (rollNumber || "").trim().toUpperCase() !== oldRoll;
+    if (alreadyUsed && isActualChange) {
+      console.log("[ROLL][BACKEND] rejected — one-time change already used");
+      return res.status(403).json({
+        success: false,
+        error: "ROLL_CHANGE_USED",
+        message:
+            "You have already changed your roll number once. Further changes can only be made by the administrator.",
+      });
+    }
+
     console.log("[ROLL][BACKEND] transaction started");
-    const result = await claimRollNumberAtomic(studentId, rollNumber, oldRoll);
+    // Student path: enforce one-time + mark it used atomically.
+    const result = await claimRollNumberAtomic(studentId, rollNumber, oldRoll, {
+      enforceOneTime: true,
+      markUsed: true,
+    });
     console.log(`[ROLL][BACKEND] transaction success — rollNumber=${result.rollNumber}`);
     return res.json(result);
   } catch (e) {
     if (e.message === "DUPLICATE") {
       console.log("[ROLL][BACKEND] duplicate detected");
       return res.status(409).json({ success: false, error: "ROLL_NUMBER_EXISTS", message: "Roll number already exists. Please enter a different roll number." });
+    }
+    if (e.message === "ROLL_CHANGE_USED") {
+      console.log("[ROLL][BACKEND] rejected in transaction — one-time change already used");
+      return res.status(403).json({
+        success: false,
+        error: "ROLL_CHANGE_USED",
+        message:
+            "You have already changed your roll number once. Further changes can only be made by the administrator.",
+      });
     }
     console.error("[ROLL][BACKEND] transaction failed:", e.message);
     return res.status(500).json({ success: false, error: "SERVER_ERROR", message: "Failed to update roll number. Please try again." });
@@ -7845,6 +8171,8 @@ app.get("/api/bus-pass/student/:studentId", authenticateFirebaseUser, async (req
       city: d.city||"", busPassId: d.busPassId||null, verifiedForBusPass: d.verifiedForBusPass||false,
       busPassExpiry: d.busPassExpiry||null, session: d.session||"", status,
       passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, photoChangeLimit: 3,
+      // Whether the student's one-time roll-number change has been used.
+      rollNumberChangeUsed: d.rollNumberChangeUsed === true,
     }});
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
