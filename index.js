@@ -3133,10 +3133,10 @@ async function handleBus(bus, students) {
                   → Set on success; absent = not yet delivered (retryable)
 
    studentCache includes students + parents + faculty (confirmed via
-   _rebuildStudentCache merging _studentMap + _parentMap + _facultyMap).
+   _rebuildStudentbCache merging _studentMap + _parentMap + _facultyMap).
    All three are evaluated with the same busId + city matching.
 ============================================================================= */
-const STOP_NOTIF_RADIUS_KM  = 0.2;       // 200 m trigger radius (km)
+const STOP_NOTIF_RADIUS_KM  = 0.5;       // 500 m trigger radius (km)
 const STOP_NOTIF_STEPS_BACK = 2;         // notify N stops before enrolled stop
 const STOP_NOTIF_LOCK_TTL   = 5 * 60;   // 5 min NX lock window (concurrent protection)
 const STOP_NOTIF_RCPT_TTL   = 12 * 3600;// 12 h per-recipient sent key TTL
@@ -3339,11 +3339,9 @@ async function handleStopNotifications(bus, students) {
         const direction = isForward
           ? `${stops[0].name} → ${stops[stops.length - 1].name}`
           : `${stops[stops.length - 1].name} → ${stops[0].name}`;
+        // Short, professional notification — no "Your bus has reached", no "Please get ready."
         const notifTitle = "🚌 Bus Alert";
-        const notifBody  = sanitize(
-          `Your bus has reached ${triggerStop.name}. ` +
-          `${enrolledStopDisplay} is ${STOP_NOTIF_STEPS_BACK} stops away. Please get ready.`
-        );
+        const notifBody  = sanitize(`Bus reached ${triggerStop.name} — 2 stops to ${enrolledStopDisplay}.`);
 
         let sentCount = 0;
         let failCount = 0;
@@ -3377,7 +3375,11 @@ async function handleStopNotifications(bus, students) {
                 direction,
                 routeType,
               },
-              android: { priority: "high", notification: { channelId: "bus_channel" } },
+              // Use the dedicated Bus Alerts channel so Android plays bus.mpeg.
+              // 'bus_alert_channel' is created by the Flutter app in main.dart
+              // with RawResourceAndroidNotificationSound('bus') pointing to
+              // android/app/src/main/res/raw/bus.mpeg.
+              android: { priority: "high", notification: { channelId: "bus_alert_channel" } },
             });
 
             // Mark this specific recipient as successfully notified
