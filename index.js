@@ -2905,10 +2905,10 @@ async function handleBus(bus, students) {
             token: u.fcmToken,
             notification: {
               title: "🚌 Bus Started",
-              body:  `${busId} has started its trip. Be ready!`,
+              body:  `Your bus ${busId} has started its journey.`,
             },
             data: { type: "bus_started", busId },
-            android: { priority: "high", notification: { channelId: "bus_channel" } },
+            android: { priority: "high", notification: { channelId: "bus_alert_channel" } },
           });
           sent++;
         } catch (e) {
@@ -3960,8 +3960,9 @@ async function handleWsChatMessage(ws, parsed) {
             if (fcmToken && fcmToken.length > 10) {
               await admin.messaging().send({
                 token: fcmToken,
-                notification: { title: "Support Reply", body: cleanMsg.substring(0, 100) },
+                notification: { title: "💬 New Reply", body: cleanMsg.substring(0, 100) },
                 data: { type: "ticket_reply", ticketId, ticketNumber: ticketData.ticketNumber || "" },
+                android: { priority: "high", notification: { channelId: "support_channel" } },
               });
             }
           }
@@ -4820,6 +4821,7 @@ app.post("/admin/send-notification", adminAuth, async (req, res) => {
         type: "admin_notification",
         busId,
       },
+      android: { notification: { channelId: "general_channel" } },
     });
 
     console.log("✅ Notification sent:", response.successCount);
@@ -4969,6 +4971,7 @@ app.post("/admin/send-notification-bus", adminAuth, async (req, res) => {
         tokens: batch,
         notification: { title, body: message },
         data: { type: "admin_notification", institution: inst, busId: busId || "", audienceType: audience },
+        android: { notification: { channelId: "general_channel" } },
       });
       totalSuccess += response.successCount;
       totalFail += response.failureCount;
@@ -5110,6 +5113,7 @@ app.post("/admin/send-notification-institution", adminAuth, async (req, res) => 
           type: "admin_notification",
           institution: inst,
         },
+        android: { notification: { channelId: "general_channel" } },
       });
       totalSuccess += response.successCount;
       totalFail    += response.failureCount;
@@ -5717,13 +5721,14 @@ app.patch("/admin/complaint-status/:id", adminAuth, async (req, res) => {
                 await admin.messaging().send({
                   token: fcmToken,
                   notification: {
-                    title: "Complaint Resolved",
+                    title: "✅ Complaint Resolved",
                     body: "Your complaint has been resolved by the administration.",
                   },
                   data: {
                     type: "complaint_resolved",
                     complaintId: id,
                   },
+                  android: { priority: "high", notification: { channelId: "support_channel" } },
                 });
                 console.log(`✅ Complaint resolved notification sent to ${userId} (${role})`);
               }
@@ -6236,7 +6241,7 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
               await admin.messaging().send({
                 token: fcmToken,
                 notification: {
-                  title: "Support Reply",
+                  title: "💬 New Reply",
                   body: message.trim().substring(0, 100),
                 },
                 data: {
@@ -6244,6 +6249,7 @@ app.post("/api/tickets/:ticketId/messages", ticketLimiter, authenticateAny, asyn
                   ticketId: ticketId,
                   ticketNumber: ticketData.ticketNumber || "",
                 },
+                android: { priority: "high", notification: { channelId: "support_channel" } },
               });
             }
           }
@@ -6418,7 +6424,7 @@ app.post("/admin/bulk-notify", adminAuth, async (req, res) => {
       if (tokens.length === 0) continue;
 
       // Send via FCM
-      const payload = { notification: { title: sanitize(title), body: sanitize(message) }, data: { type: "admin_notification", busId: normalizedBusId } };
+      const payload = { notification: { title: sanitize(title), body: sanitize(message) }, data: { type: "admin_notification", busId: normalizedBusId }, android: { notification: { channelId: "general_channel" } } };
       try {
         const response = await admin.messaging().sendEachForMulticast({ tokens, ...payload });
         totalSent += response.successCount;

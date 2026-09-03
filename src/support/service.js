@@ -89,8 +89,9 @@ async function adminReply(ticketId, senderId, senderName, message) {
       if (fcmToken && fcmToken.length > 10) {
         await admin.messaging().send({
           token: fcmToken,
-          notification: { title: "Support Reply", body: message.trim().substring(0, 100) },
+          notification: { title: "💬 New Reply", body: message.trim().substring(0, 100) },
           data: { type: "ticket_reply", ticketId, ticketNumber: ticket.ticketNumber || "" },
+          android: { priority: "high", notification: { channelId: "support_channel" } },
         });
       }
     }
