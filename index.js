@@ -3099,294 +3099,323 @@ async function handleBus(bus, students) {
   }
 
   // ── Route/stop-based proximity notifications ─────────────────────────────
-  // Replaced the old student-GPS-dependent 5 km nearby notification with a
-  // route-stop engine that does NOT require the student's live location.
-  // Any student enrolled on this bus receives a notification when the bus
-  // reaches the stop that is exactly 2 positions before their enrolled city
-  // in the current travel direction.
   await handleStopNotifications(bus, students);
 }
 
 /* =============================================================================
-   STOP-PROXIMITY NOTIFICATION ENGINE  (v2)
+   STOP-PROXIMITY NOTIFICATION ENGINE  (v3)
    ─────────────────────────────────────────────────────────────────────────────
-   Fixes applied in v2:
-   1. FCM failure does NOT permanently consume the notification.
-      Per-recipient keys track individual delivery; a failed send is retryable
-      on the next GPS update.  A group-level "pending" key prevents concurrent
-      duplicate sends from racing GPS packets while still allowing retries after
-      genuine failures.
+   Fixes in v3:
+   1. Removed speed guard (Guard 3 was blocking notifications when bus was
+      slowing down at the trigger stop — exactly when you want to notify).
+      Direction is already confirmed before this function runs.
 
-   2. Direction must be CONFIRMED before any notification fires.
-      The function checks busRouteState[busId]?.isForward; if undefined (not yet
-      seeded by the direction engine) the call is skipped.  No ?? true default.
+   2. Relaxed trip requirement: also fires when bus.tripActive=true even if
+      tripStatusMap has no currentTripId yet (server restart / first GPS).
+      Uses a synthetic tripId based on today's date as fallback so Redis dedup
+      is still per-day (trip resets at midnight, matching route schedule).
 
-   3. Multi-route: if a bus serves both college and school students, each
-      institution group is evaluated against its own route graph.  Students are
-      never evaluated against the wrong route.
+   3. Comprehensive diagnostic logging at every early-exit and decision point
+      so the next test immediately shows exactly which guard fired and why.
 
-   Dedup key schema:
-     Group lock:
-       notif:stop:lock:{busId}:{tripId}:{safeTriggerId}:{safeStudentId}
-       → Set to "pending" while sending, "done" when ≥1 FCM succeeds.
-       → "pending" prevents concurrent duplicate fires; retried if FCM all fail.
-     Per-recipient delivery record:
-       notif:stop:rcpt:{tokenHash}:{tripId}:{safeTriggerId}:{safeStudentId}
-       → Set after individual FCM succeeds; prevents re-sending to that token.
-       → Separate from the group lock so partial success is handled correctly.
+   4. Per-recipient dedup only — the group-level "DONE" shortcut was removed.
+      Each recipient's Redis key is independently "sent" or retryable.
+      Concurrent GPS race is still protected by a short NX lock per
+      (busId, tripId, triggerStop, enrolledStop) tuple.
+
+   5. `_pruneInvalidToken` collection determined from actual recipient source,
+      not hardcoded to "students".
+
+   Redis key schema (unchanged, still per-trip):
+     Race lock:   notif:stop:lock:{busId}:{tripId}:{triggerKey}:{studentKey}
+                  → NX, 5 min TTL — prevents concurrent duplicate sends
+     Per-recipient: notif:stop:rcpt:{tokenHash}:{tripId}:{triggerKey}:{studentKey}
+                  → Set on success; absent = not yet delivered (retryable)
+
+   studentCache includes students + parents + faculty (confirmed via
+   _rebuildStudentCache merging _studentMap + _parentMap + _facultyMap).
+   All three are evaluated with the same busId + city matching.
 ============================================================================= */
-const STOP_NOTIF_RADIUS_KM   = 0.2;        // 200 m trigger radius
-const STOP_NOTIF_STEPS_BACK  = 2;          // notify N stops before enrolled stop
-const STOP_NOTIF_LOCK_TTL    = 5 * 60;     // 5 min — "pending" lock window
-const STOP_NOTIF_DONE_TTL    = 12 * 3600;  // 12 h — "done" / per-recipient TTL
-const STOP_NOTIF_PENDING     = "pending";
-const STOP_NOTIF_DONE        = "done";
+const STOP_NOTIF_RADIUS_KM  = 0.2;       // 200 m trigger radius (km)
+const STOP_NOTIF_STEPS_BACK = 2;         // notify N stops before enrolled stop
+const STOP_NOTIF_LOCK_TTL   = 5 * 60;   // 5 min NX lock window (concurrent protection)
+const STOP_NOTIF_RCPT_TTL   = 12 * 3600;// 12 h per-recipient sent key TTL
 
-/**
- * Short stable hash of an FCM token for use in Redis keys.
- * We never store the token in a key (tokens are long/opaque); a 10-char hex
- * prefix of its SHA-256 is enough to distinguish recipients within a trip.
- */
 function _tokenHash(token) {
   return require("crypto").createHash("sha256").update(token).digest("hex").slice(0, 10);
 }
 
-/**
- * Core stop-notification engine.  Called from handleBus() on every GPS update.
- *
- * @param {object} bus      — normalised bus object (.busId, .lat, .lng, .speed)
- * @param {Array}  students — in-memory student cache (Firestore onSnapshot)
- */
+// Determine which Firestore collection a cached user entry came from.
+// _extractFields is called with idField="studentId" for all three collections,
+// so we use the `role` and `studentType` fields to distinguish.
+function _collectionForUser(user) {
+  const role        = (user.role        || "").toLowerCase();
+  const studentType = (user.studentType || "").toLowerCase();
+  const inst        = (user.institution || "").toLowerCase();
+  if (role === "parent" || studentType === "parent") return "parents";
+  if (role === "faculty" || studentType === "faculty") return "faculty";
+  return "students"; // default: student
+}
+
 async function handleStopNotifications(bus, students) {
   const busId = bus.busId;
 
-  // Guard 1: valid GPS
-  if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng)) return;
+  // ── Guard 1: valid GPS ────────────────────────────────────────────────────
+  if (!Number.isFinite(bus.lat) || !Number.isFinite(bus.lng)) {
+    console.log(`[STOP-NOTIF] bus=${busId} SKIP: invalid GPS lat=${bus.lat} lng=${bus.lng}`);
+    return;
+  }
 
-  // Guard 2: active trip required — no positioning / depot movement noise
+  // ── Guard 2: need a trip ID for per-trip dedup ────────────────────────────
+  // Primary: tripStatusMap currentTripId (most reliable, covers restart).
+  // Fallback: if bus.tripActive is true but tripStatusMap not yet populated
+  //   (server just restarted and first packet speed may be < TRIP_START_SPEED),
+  //   use a date-based synthetic tripId so the dedup key is still meaningful.
   const tripState = tripStatusMap[busId];
-  const tripId    = tripState?.currentTripId;
-  if (!tripId) return;
+  let tripId = tripState?.currentTripId;
 
-  // Guard 3: bus must be moving
-  if (bus.speed < 5) return;
+  if (!tripId) {
+    if (bus.tripActive) {
+      // Bus is flagged as active (speed > 10 in TATA/Voltysoft/SML normalisation)
+      // but trip logging hasn't created a tripStatusMap entry yet.
+      // Use a synthetic day-scoped ID so dedup still works correctly.
+      const today = new Date().toISOString().split("T")[0];
+      tripId = `${busId}_${today}_synthetic`;
+      console.log(`[STOP-NOTIF] bus=${busId} using synthetic tripId (tripActive=true, tripStatusMap empty)`);
+    } else {
+      console.log(`[STOP-NOTIF] bus=${busId} SKIP: no active trip (tripActive=${bus.tripActive} currentTripId=null)`);
+      return;
+    }
+  }
 
-  // Guard 4: direction must be CONFIRMED by the existing direction engine.
-  // busRouteState[busId] is seeded/updated by getRouteInfo() which runs in
-  // formatBuses / formatSMLBuses / tata-push BEFORE handleBus is called.
-  // If isForward is still undefined (engine hasn't seen enough GPS history),
-  // skip — better to delay one notification than send it to the wrong stop.
+  // ── Guard 3: direction must be CONFIRMED ──────────────────────────────────
+  // busRouteState[busId] is seeded by getRouteInfo() which runs in
+  // formatBuses / formatSMLBuses / tata-push BEFORE handleBus.
+  // No ?? true fallback — wrong direction = wrong trigger stop = false alarm.
   const dirState = busRouteState[busId];
   if (!dirState || dirState.isForward === undefined || dirState.isForward === null) {
-    // Log once per bus until direction is known (only while bus is active)
-    console.log(`[STOP-NOTIF] bus=${busId} SKIP_NO_DIRECTION — waiting for GPS direction engine`);
+    console.log(`[STOP-NOTIF] bus=${busId} SKIP: direction not yet confirmed (busRouteState=${JSON.stringify(dirState)})`);
     return;
   }
   const isForward = dirState.isForward;
 
-  // Normalise busId for comparison (same convention as rest of codebase)
+  console.log(`[STOP-NOTIF] bus=${busId} speed=${bus.speed} tripId=${tripId} dir=${isForward ? "FORWARD" : "REVERSE"}`);
+
+  // Normalise busId (same convention as rest of codebase)
   const liveBusNorm = String(busId || "").trim().toUpperCase().replace(/\s+/g, "-");
 
-  // ── Group students by institution so each group is evaluated against its
-  //    own route graph.  A bus may have a college route AND a school route;
-  //    evaluating school students against the college route (or vice-versa)
-  //    would calculate the wrong trigger stop.
-  // ──────────────────────────────────────────────────────────────────────────
-  const institutionGroups = new Map(); // routeType string → student[]
+  // ── Group recipients by institution so each uses its own route graph ──────
+  // studentCache = students + parents + faculty (all have busId + city + fcmToken
+  // extracted via _extractFields). No role-specific filter needed here —
+  // anyone with a matching busId + city + fcmToken gets the notification.
+  const institutionGroups = new Map(); // "college"|"school" → recipient[]
   for (const s of students) {
     if (!s.fcmToken || !s.city) continue;
     const storedBusNorm = String(s.busId || "").trim().toUpperCase().replace(/\s+/g, "-");
     if (storedBusNorm !== liveBusNorm) continue;
-    // Resolve institution: student.institution > student.studentType > "college"
     const inst = (
       (s.institution || "").toLowerCase() ||
       (s.studentType  || "").toLowerCase() ||
       "college"
     );
-    const key = (inst === "school") ? "school" : "college"; // normalise to two known types
+    const key = (inst === "school") ? "school" : "college";
     if (!institutionGroups.has(key)) institutionGroups.set(key, []);
     institutionGroups.get(key).push(s);
   }
 
-  if (institutionGroups.size === 0) return;
+  if (institutionGroups.size === 0) {
+    console.log(`[STOP-NOTIF] bus=${busId} SKIP: no recipients found in studentCache for busId`);
+    return;
+  }
 
-  // Process each institution group with its own route graph
-  for (const [routeType, groupStudents] of institutionGroups) {
+  console.log(`[STOP-NOTIF] bus=${busId} institution_groups=[${[...institutionGroups.keys()].join(",")}]` +
+    ` total_candidates=${[...institutionGroups.values()].reduce((n,a)=>n+a.length,0)}`);
 
-    // Fetch institution-specific route graph (in-memory cached after first call)
+  // ── Process each institution group with its own route graph ───────────────
+  for (const [routeType, groupRecipients] of institutionGroups) {
     const routeDoc = await _fetchRouteForInstitution(busId, routeType);
-    if (!routeDoc) continue;
+    if (!routeDoc) {
+      console.log(`[STOP-NOTIF] bus=${busId} route=${routeType} SKIP: no active route found in Firestore`);
+      continue;
+    }
     const routeGraph = buildRouteGraph(routeDoc);
-    if (!routeGraph?.merged?.length) continue;
-    const stops = routeGraph.merged; // ordered city[] with .name, .lat, .lng
+    if (!routeGraph?.merged?.length) {
+      console.log(`[STOP-NOTIF] bus=${busId} route=${routeType} SKIP: route graph empty`);
+      continue;
+    }
+    const stops = routeGraph.merged;
 
-    // Collect unique enrolled-stop names for this institution group
+    console.log(`[STOP-NOTIF] bus=${busId} route=${routeType} routeName="${routeDoc.routeName || "?"}" stops=${stops.length}`);
+
+    // Unique enrolled-stop names for this group
     const enrolledStops = new Set();
-    for (const s of groupStudents) {
+    for (const s of groupRecipients) {
       enrolledStops.add(s.city.trim().toLowerCase());
     }
 
     for (const enrolledCityLower of enrolledStops) {
 
-      // ── Find enrolled stop in route ──────────────────────────────────────
-      // stops[] is ordered by polyline position (sequence-stable).
-      // Forward direction = bus travels from stops[0] toward stops[n-1];
-      // index increases as bus moves forward along the route.
+      // ── Find enrolled stop in route ───────────────────────────────────────
       const enrolledIdx = stops.findIndex(
         (c) => (c.name || "").trim().toLowerCase() === enrolledCityLower
       );
       if (enrolledIdx === -1) {
-        console.log(`[STOP-NOTIF] bus=${busId} route=${routeType} SKIP_STOP_NOT_FOUND student_stop="${enrolledCityLower}"`);
+        console.log(`[STOP-NOTIF] bus=${busId} route=${routeType} SKIP: enrolled_stop="${enrolledCityLower}" not found in route stops=[${stops.map(s=>s.name).join(",")}]`);
         continue;
       }
 
-      // ── Calculate trigger-stop index ─────────────────────────────────────
-      // Forward (index increases in travel direction):
-      //   bus approaches enrolled stop from LOWER index → trigger = idx - 2
-      //   Example: enrolled=stops[4] (idx=4) → trigger=stops[2] (idx=2)
-      //
-      // Reverse (index decreases in travel direction):
-      //   bus approaches enrolled stop from HIGHER index → trigger = idx + 2
-      //   Example: enrolled=stops[4] (idx=4) → trigger=stops[6] (idx=6)
+      // ── Calculate trigger-stop index ──────────────────────────────────────
+      // forward:  bus approaches from lower index → trigger = enrolledIdx - 2
+      // reverse:  bus approaches from higher index → trigger = enrolledIdx + 2
       const triggerIdx = isForward
         ? enrolledIdx - STOP_NOTIF_STEPS_BACK
         : enrolledIdx + STOP_NOTIF_STEPS_BACK;
 
-      // Guard: trigger index out of route bounds → no notification (edge case B)
-      if (triggerIdx < 0 || triggerIdx >= stops.length) continue;
+      if (triggerIdx < 0 || triggerIdx >= stops.length) {
+        console.log(`[STOP-NOTIF] bus=${busId} enrolled_stop="${stops[enrolledIdx].name}" triggerIdx=${triggerIdx} SKIP: out of route bounds (stops=${stops.length})`);
+        continue;
+      }
 
       const triggerStop = stops[triggerIdx];
 
-      // Guard: trigger stop coordinates valid (edge case E)
-      if (!Number.isFinite(triggerStop.lat) || !Number.isFinite(triggerStop.lng)) continue;
+      if (!Number.isFinite(triggerStop.lat) || !Number.isFinite(triggerStop.lng)) {
+        console.log(`[STOP-NOTIF] bus=${busId} trigger_stop="${triggerStop.name}" SKIP: invalid stop coordinates`);
+        continue;
+      }
 
-      // ── 200 m geofence: bus GPS → trigger-stop GPS ───────────────────────
-      // Student GPS is NEVER used here.
+      // ── 200 m geofence: bus GPS → trigger stop GPS ────────────────────────
       const distKm = calculateDistance(bus.lat, bus.lng, triggerStop.lat, triggerStop.lng);
-      if (!Number.isFinite(distKm) || distKm > STOP_NOTIF_RADIUS_KM) continue;
+      const distM  = Math.round(distKm * 1000);
 
-      // ── Build stable Redis key fragments ─────────────────────────────────
+      console.log(
+        `[STOP-NOTIF] bus=${busId} enrolled="${stops[enrolledIdx].name}" trigger="${triggerStop.name}"` +
+        ` busLat=${bus.lat.toFixed(5)} busLng=${bus.lng.toFixed(5)}` +
+        ` stopLat=${triggerStop.lat.toFixed(5)} stopLng=${triggerStop.lng.toFixed(5)}` +
+        ` dist=${distM}m threshold=${STOP_NOTIF_RADIUS_KM * 1000}m`
+      );
+
+      if (!Number.isFinite(distKm) || distKm > STOP_NOTIF_RADIUS_KM) {
+        // Not close enough — log only if reasonably close to avoid log spam
+        if (distKm <= 1.0) {
+          console.log(`[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}" dist=${distM}m > 200m — not in range yet`);
+        }
+        continue;
+      }
+
+      // ── Collect actual recipients for this enrolled stop ──────────────────
+      const recipients = groupRecipients.filter(
+        (s) => s.fcmToken && s.city &&
+               s.city.trim().toLowerCase() === enrolledCityLower
+      );
+
+      if (recipients.length === 0) {
+        console.log(`[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}" enrolled="${enrolledCityLower}" SKIP: no recipients with fcmToken`);
+        continue;
+      }
+
+      console.log(`[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}" dist=${distM}m IN_RANGE — ${recipients.length} recipient(s)`);
+
+      // ── Safe Redis key fragments ───────────────────────────────────────────
       const safeTriggerId = triggerStop.name.replace(/[^A-Za-z0-9]/g, "_");
       const safeStudentId = enrolledCityLower.replace(/[^A-Za-z0-9]/g, "_");
       const lockKey       = `notif:stop:lock:${busId}:${tripId}:${safeTriggerId}:${safeStudentId}`;
 
-      // ── Group-level lock check ────────────────────────────────────────────
-      // Values:
-      //   undefined/"none" → not yet attempted this trip
-      //   STOP_NOTIF_PENDING ("pending") → a concurrent GPS packet is sending
-      //   STOP_NOTIF_DONE   ("done")     → at least one FCM succeeded; all
-      //                                    recipients individually tracked
-      const lockVal = await redis.get(lockKey);
-
-      if (lockVal === STOP_NOTIF_DONE) continue; // fully delivered, skip
-
-      if (lockVal === STOP_NOTIF_PENDING) {
-        // Another GPS packet is mid-send for this stop/trip combo.
-        // Skip to avoid duplicates; if that attempt fails, the lock TTL (5 min)
-        // will expire and the next GPS packet will retry.
-        continue;
-      }
-
-      // ── Collect recipients for this stop ──────────────────────────────────
-      const recipients = groupStudents.filter(
-        (s) => s.fcmToken && s.city &&
-               s.city.trim().toLowerCase() === enrolledCityLower
-      );
-      if (recipients.length === 0) continue;
-
-      // ── Acquire group lock (prevent concurrent races) ─────────────────────
-      // NX = only set if key does NOT exist (atomic)
-      const acquired = await redis.set(lockKey, STOP_NOTIF_PENDING, {
+      // ── Acquire NX lock (concurrent GPS race protection) ──────────────────
+      // Two GPS packets arriving within milliseconds of each other would both
+      // see "no rcptKey yet" and try to send. The NX lock ensures only ONE
+      // packet proceeds; the other sees the lock and skips.
+      const acquired = await redis.set(lockKey, "locked", {
         NX: true,
         EX: STOP_NOTIF_LOCK_TTL,
       });
-      // acquired === "OK" means we won the lock; null means another process beat us
-      if (!acquired) continue; // lost the race — other process is sending
+      if (!acquired) {
+        console.log(`[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}" SKIP: NX lock already held (concurrent GPS packet sending)`);
+        continue;
+      }
 
-      const enrolledStopDisplay = stops[enrolledIdx].name;
-      const direction = isForward
-        ? `${stops[0].name} → ${stops[stops.length - 1].name}`
-        : `${stops[stops.length - 1].name} → ${stops[0].name}`;
-      const notifTitle = "🚌 Bus Alert";
-      const notifBody  = sanitize(
-        `Your bus has reached ${triggerStop.name}. ` +
-        `${enrolledStopDisplay} is ${STOP_NOTIF_STEPS_BACK} stops away. Please get ready.`
-      );
+      // Lock acquired — release it in finally so it never blocks future GPS
+      try {
+        const enrolledStopDisplay = stops[enrolledIdx].name;
+        const direction = isForward
+          ? `${stops[0].name} → ${stops[stops.length - 1].name}`
+          : `${stops[stops.length - 1].name} → ${stops[0].name}`;
+        const notifTitle = "🚌 Bus Alert";
+        const notifBody  = sanitize(
+          `Your bus has reached ${triggerStop.name}. ` +
+          `${enrolledStopDisplay} is ${STOP_NOTIF_STEPS_BACK} stops away. Please get ready.`
+        );
 
-      console.log(
-        `[STOP-NOTIF] bus=${busId} route=${routeType} dir=${isForward ? "forward" : "reverse"}` +
-        ` student_stop="${enrolledStopDisplay}" trigger_stop="${triggerStop.name}"` +
-        ` dist=${(distKm * 1000).toFixed(0)}m recipients=${recipients.length} action=SEND`
-      );
+        let sentCount = 0;
+        let failCount = 0;
+        let skipCount = 0;
 
-      let sent = 0;
-      let anySuccess = false;
+        for (const user of recipients) {
+          // ── Per-recipient dedup: sent key ────────────────────────────────
+          const rcptKey = `notif:stop:rcpt:${_tokenHash(user.fcmToken)}:${tripId}:${safeTriggerId}:${safeStudentId}`;
+          const alreadyDone = await redis.get(rcptKey);
 
-      for (const user of recipients) {
-        // ── Per-recipient skip: already delivered to this token this trip ──
-        const rcptKey = `notif:stop:rcpt:${_tokenHash(user.fcmToken)}:${tripId}:${safeTriggerId}:${safeStudentId}`;
-        const rcptDone = await redis.get(rcptKey);
-        if (rcptDone) {
-          sent++; // count as delivered (no re-send needed)
-          anySuccess = true;
-          continue;
-        }
+          if (alreadyDone) {
+            console.log(`[STOP-NOTIF] SKIP_ALREADY_SENT userId=${user.studentId || user.uid} rcptKey_val="${alreadyDone}"`);
+            skipCount++;
+            continue;
+          }
 
-        try {
-          await admin.messaging().send({
-            token: user.fcmToken,
-            notification: { title: notifTitle, body: notifBody },
-            data: {
-              type:        "bus_stop_alert",
-              busId,
-              tripId,
-              triggerStop: triggerStop.name,
-              studentStop: enrolledStopDisplay,
-              stopsAway:   String(STOP_NOTIF_STEPS_BACK),
-              direction,
-              routeType,
-            },
-            android: { priority: "high", notification: { channelId: "bus_channel" } },
-          });
+          const tokenPreview = user.fcmToken ? `${user.fcmToken.slice(0, 8)}…` : "MISSING";
+          console.log(`[STOP-NOTIF] SENDING → userId=${user.studentId || user.uid} token=${tokenPreview}`);
 
-          // Mark this token as delivered — prevents re-send even if group lock
-          // somehow expires and another GPS update re-enters for this trip.
-          await redis.setEx(rcptKey, STOP_NOTIF_DONE_TTL, "1");
-          sent++;
-          anySuccess = true;
+          try {
+            await admin.messaging().send({
+              token: user.fcmToken,
+              notification: { title: notifTitle, body: notifBody },
+              data: {
+                type:        "bus_stop_alert",
+                busId,
+                tripId,
+                triggerStop: triggerStop.name,
+                studentStop: enrolledStopDisplay,
+                stopsAway:   String(STOP_NOTIF_STEPS_BACK),
+                direction,
+                routeType,
+              },
+              android: { priority: "high", notification: { channelId: "bus_channel" } },
+            });
 
-        } catch (e) {
-          if (
-            e.code === "messaging/registration-token-not-registered" ||
-            e.code === "messaging/invalid-registration-token"
-          ) {
-            // Invalid token — prune it and mark as done (no point retrying)
-            _pruneInvalidToken(user.fcmToken, user.studentId, "students");
-            await redis.setEx(rcptKey, STOP_NOTIF_DONE_TTL, "pruned");
-            anySuccess = true; // treat as "done" for this recipient
-          } else {
-            // Transient failure — do NOT set rcptKey; allow retry on next GPS update
-            console.log(`[STOP-NOTIF] FCM transient fail ${user.studentId}: ${e.message}`);
+            // Mark this specific recipient as successfully notified
+            await redis.setEx(rcptKey, STOP_NOTIF_RCPT_TTL, "sent");
+            console.log(`[STOP-NOTIF] FCM=SUCCESS userId=${user.studentId || user.uid}`);
+            sentCount++;
+
+          } catch (fcmErr) {
+            if (
+              fcmErr.code === "messaging/registration-token-not-registered" ||
+              fcmErr.code === "messaging/invalid-registration-token"
+            ) {
+              // Token is permanently invalid — prune it from the correct collection
+              const collection = _collectionForUser(user);
+              _pruneInvalidToken(user.fcmToken, user.studentId, collection);
+              // Mark as done so we don't keep attempting this dead token
+              await redis.setEx(rcptKey, STOP_NOTIF_RCPT_TTL, "pruned");
+              console.log(`[STOP-NOTIF] FCM=INVALID_TOKEN userId=${user.studentId || user.uid} collection=${collection} — pruned`);
+              skipCount++;
+            } else {
+              // Transient FCM error — do NOT set rcptKey; retry on next GPS update
+              console.log(`[STOP-NOTIF] FCM=TRANSIENT_FAIL userId=${user.studentId || user.uid} code=${fcmErr.code} msg=${fcmErr.message}`);
+              failCount++;
+            }
           }
         }
-      }
 
-      // ── Update group lock based on outcome ───────────────────────────────
-      if (anySuccess) {
-        // At least one recipient delivered (or pruned). Promote lock to "done"
-        // with full 12 h TTL to suppress future group-level re-evaluations.
-        await redis.setEx(lockKey, STOP_NOTIF_DONE_TTL, STOP_NOTIF_DONE);
-      } else {
-        // All FCM sends failed transiently. Release the pending lock (delete it)
-        // so the next GPS update can retry the entire group.
+        console.log(
+          `[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}" enrolled="${enrolledStopDisplay}"` +
+          ` sent=${sentCount} skipped=${skipCount} failed=${failCount}`
+        );
+
+      } finally {
+        // Always release the NX lock so future GPS packets aren't permanently blocked.
+        // If all sends failed transiently, this allows the next GPS update to retry.
+        // If some succeeded, rcptKeys for those recipients prevent re-sending.
         await redis.del(lockKey);
       }
-
-      console.log(
-        `[STOP-NOTIF] bus=${busId} trigger="${triggerStop.name}"` +
-        ` student_stop="${enrolledStopDisplay}" sent=${sent}/${recipients.length}` +
-        ` anySuccess=${anySuccess}`
-      );
     }
   }
 }
