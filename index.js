@@ -8207,7 +8207,7 @@ app.get("/api/bus-pass/student/:studentId", authenticateFirebaseUser, async (req
       course: d.course||"", year: d.year||d.academicYear||"", busId: d.busId||"",
       city: d.city||"", busPassId: d.busPassId||null, verifiedForBusPass: d.verifiedForBusPass||false,
       busPassExpiry: d.busPassExpiry||null, session: d.session||"", status,
-      passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0, photoChangeLimit: 3,
+      passPhotoUrl: d.passPhotoUrl||null, photoChangeCount: d.photoChangeCount||0,
       // Whether the student's one-time roll-number change has been used.
       rollNumberChangeUsed: d.rollNumberChangeUsed === true,
     }});
@@ -8287,21 +8287,10 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     if (!userDoc) return res.status(404).json({ error: "User not found for this account" });
     const studentId = userId;
     const d = userDoc.data();
-    // SERVER-SIDE limit enforcement: hard limit of 3 photo uploads per academic year
-    // Academic year resets on August 1st each year
-    const now = new Date();
-    const currentAcademicYear = now.getMonth() >= 7 ? now.getFullYear() : now.getFullYear() - 1; // Aug(7)=current year, Jan-Jul=previous year
+    // Photo upload limit removed — students can upload unlimited profile photos.
+    // The rewardad gate (one rewarded ad per photo change) remains in the Flutter
+    // client as the UX requirement, but there is no server-side count cap.
     let count = d.photoChangeCount || 0;
-    if ((d.photoChangeResetYear || 0) < currentAcademicYear) count = 0;
-    console.log("[BACKEND 4] studentId:", studentId, "count:", count, "limit: 3, academicYear:", currentAcademicYear);
-    if (count >= 3) {
-      console.log("[BACKEND 4] ❌ LIMIT REACHED. count >= 3");
-      return res.status(429).json({
-        error: "Maximum 3 photo uploads allowed per academic year (resets Aug 1)",
-        photoChangeCount: count,
-        photoChangeLimit: 3,
-      });
-    }
     // Upload via Admin SDK ONLY (client has zero Storage access)
     const bucket = admin.storage().bucket("scep-bus.firebasestorage.app");
     const filePath = `bus-pass-photos/${req.firebaseUid}/profile.jpg`;
@@ -8328,18 +8317,16 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
       passPhotoUrl: signedUrl,
       passPhotoPath: filePath,
       photoChangeCount: count,
-      photoChangeResetYear: currentAcademicYear,
       photoUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     console.log("[BACKEND 10] Updating Firestore... photoChangeCount:", count);
     await admin.firestore().collection(userCollection).doc(studentId).update(updateData);
     console.log("[BACKEND 10] ✅ Firestore updated");
-    console.log(`[BACKEND 11] ✅ SUCCESS. studentId=${studentId} count=${count}/3`);
+    console.log(`[BACKEND 11] ✅ SUCCESS. studentId=${studentId} count=${count}`);
     return res.json({
       success: true,
       photoUrl: signedUrl,
       photoChangeCount: count,
-      photoChangeLimit: 3,
     });
   } catch (e) {
     console.log("[BACKEND] ❌ EXCEPTION:", e.message);
