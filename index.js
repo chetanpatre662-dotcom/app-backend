@@ -726,199 +726,59 @@ const SML_API = {
   tokenExpiry: null,
 };
 
-/* ==========================================================================
-   BUS CACHE — DB-DRIVEN IN-MEMORY LOOKUP
-   ──────────────────────────────────────────────────────────────────────────
-   Single source of truth: Firestore `buses/{busId}` collection.
-
-   At startup, loadBusCache() reads every active bus document and builds
-   four fast O(1) lookup tables that the GPS processing hot-path uses:
-
-     _bc_imeiToBusId   { imei       → busId }
-     _bc_driverMap     { busId      → driverName }
-     _bc_driverMobile  { busId      → driverMobile }
-     _bc_smlChassis    { chassis    → { imei, busId } }
-
-   The GPS polling loop (formatBuses / formatSMLBuses / tata push) NEVER
-   calls Firestore — it only reads these in-memory tables.
-
-   When an admin creates / updates / deletes a bus via the CRUD API the
-   affected doc is written to Firestore then reloadBusCache() refreshes all
-   tables instantly with no server restart.
-
-   SEED FALLBACK: If Firestore is unreachable at startup the hard-coded
-   seeds below are used so GPS tracking never goes dark.
-   ========================================================================== */
-
-// ── Hardcoded seeds (fallback only — used when Firestore is unavailable) ──
-const _BC_SEEDS = [
-  { busId: "BUS-1",  imei: "869372084048852", driverName: "",              driverMobile: "",             smlChassis: null,            active: true },
-  { busId: "BUS-2",  imei: "869860089492893", driverName: "",              driverMobile: "",             smlChassis: null,            active: true },
-  { busId: "BUS-4",  imei: "868329089743334", driverName: "",              driverMobile: "",             smlChassis: null,            active: true },
-  { busId: "BUS-5",  imei: "868329089729648", driverName: "",              driverMobile: "",             smlChassis: null,            active: true },
-  { busId: "BUS-6",  imei: "868329089734846", driverName: "",              driverMobile: "",             smlChassis: null,            active: true },
-  { busId: "BUS-7",  imei: "860560065510150", driverName: "Dilendra",      driverMobile: "9165266310",   smlChassis: null,            active: true },
-  { busId: "BUS-10", imei: "860560064978408", driverName: "Yogesh Matre",  driverMobile: "9876543214",   smlChassis: null,            active: true },
-  { busId: "BUS-11", imei: "860560067136350", driverName: "Sampat",        driverMobile: "9876543215",   smlChassis: "MBUZT54XGL0317250", active: true },
-  { busId: "BUS-14", imei: "862567077140767", driverName: "Shyam",         driverMobile: "9876543216",   smlChassis: "MBUZT54XEK0331171", active: true },
-  { busId: "BUS-15", imei: "866334078434509", driverName: "Yogesh Matre",  driverMobile: "9876543217",   smlChassis: "MBUZT54XBK0325975", active: true },
-];
-
-// ── In-memory lookup tables (rebuilt by loadBusCache / reloadBusCache) ────
-let _bc_imeiToBusId  = {};   // imei      → busId
-let _bc_driverMap    = {};   // busId     → driverName
-let _bc_driverMobile = {};   // busId     → driverMobile
-let _bc_smlChassis   = {};   // chassis   → { imei, busId }
-let _bc_allDocs      = {};   // busId     → full metadata doc
-
-// ── Seed tables from an array of bus metadata objects ─────────────────────
-function _bc_buildFromArray(buses) {
-  const imeiMap = {}, driverMap = {}, mobileMap = {}, smlMap = {}, allMap = {};
-  for (const b of buses) {
-    if (!b.busId) continue;
-    if (b.imei)       imeiMap[b.imei]        = b.busId;
-    if (b.driverName) driverMap[b.busId]     = b.driverName;
-    if (b.driverMobile) mobileMap[b.busId]   = b.driverMobile;
-    if (b.smlChassis) smlMap[b.smlChassis]   = { imei: b.imei || "", busId: b.busId };
-    allMap[b.busId] = b;
-  }
-  _bc_imeiToBusId  = imeiMap;
-  _bc_driverMap    = driverMap;
-  _bc_driverMobile = mobileMap;
-  _bc_smlChassis   = smlMap;
-  _bc_allDocs      = allMap;
-}
-
-/** Load bus metadata from Firestore. Falls back to seeds if Firestore fails. */
-async function loadBusCache() {
-  try {
-    const snap = await admin.firestore().collection("buses").get();
-    if (!snap.empty) {
-      const buses = snap.docs.map(d => ({ busId: d.id, ...d.data() }));
-      // Filter to active only for lookup tables; keep all for /admin/buses list
-      const activeBuses = buses.filter(b => b.active !== false);
-      _bc_buildFromArray(activeBuses);
-      // Store ALL docs (including inactive) so admin list shows them
-      for (const b of buses) _bc_allDocs[b.busId] = b;
-      console.log(`✅ BusCache loaded from Firestore: ${activeBuses.length} active buses (${buses.length} total)`);
-      // Seed missing documents AND patch existing docs that lack imei/smlChassis.
-      // After writing, reload from Firestore so patched IMEI data is in memory.
-      const patched = await _bc_seedMissingToFirestore(buses);
-      if (patched > 0) {
-        // Re-read Firestore now that seed fields have been merged into all docs
-        await reloadBusCache();
-      }
-      return;
-    }
-    // Collection empty — seed everything
-    console.log("⚠️  BusCache: buses collection empty — seeding from hardcoded data");
-    await _bc_seedAllToFirestore();
-    _bc_buildFromArray(_BC_SEEDS);
-  } catch (e) {
-    console.log(`⚠️  BusCache: Firestore unavailable (${e.message}) — using hardcoded fallback`);
-    _bc_buildFromArray(_BC_SEEDS);
-  }
-}
-
-/** Write seeds to Firestore for buses that don't have a document yet,
- *  AND merge GPS-critical fields (imei, smlChassis) into existing documents
- *  that are missing them. Never overwrites driverName, driverMobile, route,
- *  rtoNumber or any other admin-managed field already present.
- *  Returns the number of documents written (created + patched).
- */
-async function _bc_seedMissingToFirestore(existingBuses) {
-  const db = admin.firestore();
-  const existingMap = new Map(existingBuses.map(b => [b.busId, b]));
-  const writes = [];
-
-  for (const s of _BC_SEEDS) {
-    const existing = existingMap.get(s.busId);
-
-    if (!existing) {
-      // Document does not exist at all — create it with full seed data
-      const { busId, ...fields } = s;
-      writes.push(
-        db.collection("buses").doc(busId).set({
-          ...fields,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true })
-      );
-      continue;
-    }
-
-    // Document exists — only merge fields that are genuinely missing
-    // (undefined or null). Never overwrite fields the admin has set.
-    const patch = {};
-    if (!existing.imei       && s.imei)       patch.imei       = s.imei;
-    if (!existing.smlChassis && s.smlChassis) patch.smlChassis = s.smlChassis;
-
-    if (Object.keys(patch).length > 0) {
-      patch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
-      writes.push(db.collection("buses").doc(s.busId).update(patch));
-    }
-  }
-
-  if (writes.length === 0) return 0;
-  console.log(`🌱 BusCache: writing ${writes.length} document(s) to Firestore (new or patched missing imei/smlChassis)`);
-  await Promise.all(writes);
-  return writes.length;
-}
-
-/** Write ALL seeds to Firestore (used when collection is brand-new / empty). */
-async function _bc_seedAllToFirestore() {
-  const db = admin.firestore();
-  await Promise.all(_BC_SEEDS.map(s => {
-    const { busId, ...fields } = s;
-    return db.collection("buses").doc(busId).set({
-      ...fields,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-  }));
-  console.log(`🌱 BusCache: seeded ${_BC_SEEDS.length} buses into Firestore`);
-}
-
-/** Reload cache from Firestore (called after any admin bus CRUD operation). */
-async function reloadBusCache() {
-  try {
-    const snap = await admin.firestore().collection("buses").get();
-    const buses = snap.docs.map(d => ({ busId: d.id, ...d.data() }));
-    const activeBuses = buses.filter(b => b.active !== false);
-    _bc_buildFromArray(activeBuses);
-    for (const b of buses) _bc_allDocs[b.busId] = b;
-    console.log(`🔄 BusCache reloaded: ${activeBuses.length} active buses`);
-  } catch (e) {
-    console.log(`⚠️  BusCache reload failed: ${e.message} — keeping current cache`);
-  }
-}
-
-// ── Public accessors (O(1) synchronous — safe inside GPS hot-path) ─────────
-const BusCache = {
-  /** imei → busId, or null if not registered */
-  getBusId:        (imei)    => _bc_imeiToBusId[imei]  || null,
-  /** busId → driver name, or "N/A" */
-  getDriver:       (busId)   => _bc_driverMap[busId]   || "N/A",
-  /** busId → driver mobile, or "N/A" */
-  getDriverMobile: (busId)   => _bc_driverMobile[busId] || "N/A",
-  /** SML chassis number → { imei, busId }, or null */
-  getSmlByChassis: (chassis) => _bc_smlChassis[chassis] || null,
-  /** All busIds across active buses */
-  getAllBusIds:     ()        => Object.keys(_bc_imeiToBusId).length > 0
-                                  ? [...new Set(Object.values(_bc_imeiToBusId))]
-                                  : _BC_SEEDS.map(s => s.busId),
-  /** All SML chassis entries */
-  getAllSmlEntries: ()        => Object.values(_bc_smlChassis),
-  /** Full metadata for a busId (for admin responses) */
-  getMetadata:     (busId)   => _bc_allDocs[busId] || null,
-  /** All bus metadata docs (active + inactive) */
-  getAllDocs:       ()        => Object.values(_bc_allDocs),
+/* ======================== =
+   BUS MAP
+========================= */
+const busMap = {
+  "868329089743334": "BUS-8",
+  "868329089729648": "BUS-11",
+  "868329089734846": "BUS-12",
+  "860560064978408": "BUS-10",
+  "860560065510150": "BUS-20",
+  "860560067136350": "BUS-7",
+  "866334078434509": "BUS-5",
+  "862567077140767": "BUS-6",
+  "869860089492893": "BUS-2",
+  "869372084048852": "BUS-1",
 };
 
-// ── Legacy aliases removed — all consumers now use BusCache.* accessors ──
+const driverMap = {
+ 
+  "BUS-10": "Yogesh Matre",
+  "BUS-7": "Dilendra",
+  "BUS-11": "Sampat",
+  "BUS-15": "Yogesh Matre",
+  "BUS-14": "Shyam ",
+};
+
+const driverMobileMap = {
+ 
+  "BUS-7": "9165266310",
+  "BUS-10": "9876543214",
+  "BUS-11": "9876543215",
+  "BUS-14": "9876543216",
+  "BUS-15": "9876543217",
+};
+
+const smlBusMap = {
+  MBUZT54XBK0325975: {
+    imei: "866334078434509",
+    busId: "BUS-5",
+  },
+
+  MBUZT54XEK0331171: {
+    imei: "862567077140767",
+    busId: "BUS-6",
+  },
+
+  MBUZT54XGL0317250: {
+    imei: "860560067136350",
+    busId: "BUS-7",
+  },
+};
 
 /* =========================
-   TATA PUSH — BUS-2 via IMEI 869860089492893 in busCache above.
+   TATA PUSH — BUS-2 via IMEI 869860089492893 in busMap above.
    Tata integration endpoint is defined later in this file (POST/GET /tata/push).
 ========================= */
 
@@ -1417,7 +1277,9 @@ async function invalidateRouteCache(busId) {
  * Runs once so the first loop iteration hits in-memory for all buses.
  */
 async function preWarmRouteCache() {
-  const allBusIds = BusCache.getAllBusIds();
+  const allBusIds = [
+    ...new Set([...Object.values(busMap), ...Object.values(smlBusMap).map((m) => m.busId)])
+  ];
   await Promise.allSettled(allBusIds.map((id) => getRouteGraph(normalizeBusId(id))));
 
   // Also pre-warm institution-specific cache for shared bus handling
@@ -2466,10 +2328,10 @@ async function formatBuses(data) {
 
       const d = normalize(item);
 
-      if (!BusCache.getBusId(d.imei)) {
+      if (!busMap[d.imei]) {
         if (!_unknownImeiLogged.has(d.imei)) {
           _unknownImeiLogged.add(d.imei);
-          console.log("⚠️ Ignoring unknown IMEI (not in busCache):", d.imei);
+          console.log("⚠️ Ignoring unknown IMEI (not in busMap):", d.imei);
         }
         return null;
       }
@@ -2478,7 +2340,7 @@ async function formatBuses(data) {
         return null;
       }
 
-      const busId = BusCache.getBusId(d.imei);
+      const busId = busMap[d.imei];
 
       // ── FAST PATH: All cache layers are in-memory after first iteration ──
       // getRouteGraph hits memory cache (O(1) after pre-warm)
@@ -2523,7 +2385,7 @@ async function formatBuses(data) {
 
       return {
         busId,
-        driver: BusCache.getDriver(busId),
+        driver: driverMap[busId] || "N/A",
         route: routeGraph?.routeName || "N/A",
         routeType: routeGraph?.routeType || "college",
 
@@ -2541,7 +2403,7 @@ async function formatBuses(data) {
         lat: d.lat,
         lng: d.lng,
         speed: d.speed,
-        driverMobile: BusCache.getDriverMobile(busId),
+        driverMobile: driverMobileMap[busId] || "N/A",
 
         startTime: busStartTimes[busId]?.time || null,
         todayKm: busDistanceTracker[busId]?.totalKm?.toFixed(2) || "0",
@@ -2644,7 +2506,7 @@ async function formatSMLBuses(data) {
   // ── SML DIAGNOSTICS (no functional changes — observing only) ──────────
   _smlDiag.packetsReceived += data.length;
   for (const item of data) {
-    const map = BusCache.getSmlByChassis(item?.chassisNumber);
+    const map = smlBusMap[item?.chassisNumber];
     if (!map) continue;
     const busId = map.busId;
 
@@ -2714,7 +2576,7 @@ async function formatSMLBuses(data) {
 
   const results = await Promise.all(
     data.map(async (item) => {
-      const map = BusCache.getSmlByChassis(item.chassisNumber);
+      const map = smlBusMap[item.chassisNumber];
       if (!map) return null;
 
       const busId = map.busId;
@@ -2786,7 +2648,7 @@ logBusUpdate(busId, gpsTime, effectiveGpsMs);
 
       return {
         busId,
-        driver: BusCache.getDriver(busId),
+        driver: driverMap[busId] || "N/A",
         route: routeGraph?.routeName || "N/A",
         routeType: routeGraph?.routeType || "college",
 
@@ -2801,7 +2663,7 @@ logBusUpdate(busId, gpsTime, effectiveGpsMs);
         routeDirection: routeInfo?.direction || null,
 
         imei,
-        driverMobile: BusCache.getDriverMobile(busId),
+        driverMobile: driverMobileMap[busId] || "N/A",
 
         startTime: busStartTimes[busId]?.time || null,
 
@@ -3856,17 +3718,7 @@ async function loop() {
   setTimeout(loop, LOOP_INTERVAL_MS);
 }
 
-/* ── STARTUP BOOTSTRAP ──────────────────────────────────────────────────────
-   Load bus metadata from Firestore BEFORE the first GPS polling iteration.
-   This ensures busMap/driverMap/smlBusMap are populated from the DB so that
-   GPS packets are correctly identified on the very first loop tick.
-   Falls back to hardcoded seeds if Firestore is unreachable at boot time.
-   loadBusCache() itself never throws — it catches internally and uses seeds.
-   ─────────────────────────────────────────────────────────────────────────── */
-(async () => {
-  await loadBusCache();
-  loop();
-})();
+loop();
 
 /* =========================
    GPS HEALTH MONITOR — prints one summary every 60 seconds
@@ -4412,551 +4264,21 @@ app.get("/admin/attendance-month", adminAuth, async (req, res) => {
   }
 });
 
-/* ==========================================================================
-   BUS CRUD API — Centralized bus metadata management
-   All four endpoints require admin JWT (adminAuth).
-   Every write operation calls reloadBusCache() so the GPS hot-path sees
-   the updated data on the very next polling cycle without a server restart.
-   ========================================================================== */
-
-// GET /admin/buses — list all buses (active + inactive)
-app.get("/admin/buses", adminAuth, async (req, res) => {
-  try {
-    const snap = await admin.firestore().collection("buses").get();
-    const buses = snap.docs.map(d => ({ busId: d.id, ...d.data() }));
-
-    // Enrich each bus with live GPS status from latestBuses in-memory array
-    const enriched = buses.map(b => {
-      const live = latestBuses.find(lb => lb.busId === b.busId);
-      return {
-        ...b,
-        liveStatus: live ? {
-          lat:           live.lat,
-          lng:           live.lng,
-          speed:         live.speed,
-          status:        live.status,
-          tripActive:    live.tripActive,
-          gpsAgeSeconds: live.gpsAgeSeconds,
-          gpsState:      live.gpsState,
-          lastGpsUpdateIst: live.lastGpsUpdateIst || null,
-          timestamp:     live.timestamp,
-        } : null,
-      };
-    });
-
-    // Sort: active first, then alphabetically by busId
-    enriched.sort((a, b) => {
-      if ((a.active !== false) !== (b.active !== false)) return (a.active !== false) ? -1 : 1;
-      return (a.busId || "").localeCompare(b.busId || "");
-    });
-
-    return res.json({ success: true, count: enriched.length, buses: enriched });
-  } catch (e) {
-    console.log("GET /admin/buses error:", e.message);
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// POST /admin/buses — create a new bus
-app.post("/admin/buses", adminAuth, async (req, res) => {
-  try {
-    const {
-      busNumber, busCode, imei,
-      driverName, driverMobile,
-      rtoNumber, registrationNumber,
-      smlChassis, trackerVendor,
-      route, institution,
-      active,
-    } = req.body;
-
-    // ── Validation ──────────────────────────────────────────────────────────
-    if (!busCode || typeof busCode !== "string") {
-      return res.status(400).json({ success: false, error: "busCode is required (e.g. 'BUS-8')" });
-    }
-    const normalizedBusCode = normalizeBusId(busCode);
-
-    if (!imei || !/^\d{10,17}$/.test(String(imei).trim())) {
-      return res.status(400).json({ success: false, error: "imei is required and must be 10–17 digits" });
-    }
-    const imeiStr = String(imei).trim();
-
-    // IMEI uniqueness check
-    const existingImei = BusCache.getBusId(imeiStr);
-    if (existingImei) {
-      return res.status(409).json({ success: false, error: `IMEI ${imeiStr} is already assigned to ${existingImei}` });
-    }
-    // Also scan Firestore in case the cache hasn't caught a concurrent write
-    const imeiConflict = await admin.firestore().collection("buses")
-      .where("imei", "==", imeiStr).limit(1).get();
-    if (!imeiConflict.empty) {
-      return res.status(409).json({ success: false, error: `IMEI ${imeiStr} already exists in database` });
-    }
-
-    // busId uniqueness check
-    const existing = await admin.firestore().collection("buses").doc(normalizedBusCode).get();
-    if (existing.exists) {
-      return res.status(409).json({ success: false, error: `Bus ${normalizedBusCode} already exists` });
-    }
-
-    // ── Build document ───────────────────────────────────────────────────────
-    const doc = {
-      busNumber:          String(busNumber || normalizedBusCode.replace("BUS-", "")).trim(),
-      imei:               imeiStr,
-      driverName:         String(driverName  || "").trim(),
-      driverMobile:       String(driverMobile || "").trim(),
-      rtoNumber:          String(rtoNumber    || "").trim().toUpperCase(),
-      registrationNumber: String(registrationNumber || "").trim().toUpperCase(),
-      smlChassis:         smlChassis  ? String(smlChassis).trim()  : null,
-      trackerVendor:      trackerVendor ? String(trackerVendor).trim().toLowerCase() : "voltysoft",
-      route:              String(route || "").trim(),
-      institution:        String(institution || "college").toLowerCase(),
-      active:             active !== false,
-      createdAt:          admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt:          admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    await admin.firestore().collection("buses").doc(normalizedBusCode).set(doc);
-
-    // Update rtoMapping settings doc if rtoNumber provided
-    if (doc.rtoNumber) {
-      await admin.firestore().collection("settings").doc("rtoMapping").set(
-        { [normalizedBusCode]: doc.rtoNumber },
-        { merge: true }
-      );
-    }
-
-    // Reload cache so next GPS packet resolves correctly
-    await reloadBusCache();
-
-    console.log(`🚌 Bus CREATED: ${normalizedBusCode} imei=${imeiStr}`);
-    return res.status(201).json({ success: true, busId: normalizedBusCode, bus: { busId: normalizedBusCode, ...doc } });
-  } catch (e) {
-    console.log("POST /admin/buses error:", e.message);
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// PATCH /admin/buses/:busId — update any metadata fields for a bus
-app.patch("/admin/buses/:busId", adminAuth, async (req, res) => {
-  try {
-    const busId = normalizeBusId(req.params.busId);
-    const doc = await admin.firestore().collection("buses").doc(busId).get();
-    if (!doc.exists) {
-      return res.status(404).json({ success: false, error: `Bus ${busId} not found` });
-    }
-
-    const {
-      busNumber, imei,
-      driverName, driverMobile,
-      rtoNumber, registrationNumber,
-      smlChassis, trackerVendor,
-      route, institution,
-      active,
-    } = req.body;
-
-    const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
-
-    if (busNumber         !== undefined) update.busNumber          = String(busNumber).trim();
-    if (driverName        !== undefined) update.driverName         = String(driverName).trim();
-    if (driverMobile      !== undefined) update.driverMobile       = String(driverMobile).trim();
-    if (rtoNumber         !== undefined) update.rtoNumber          = String(rtoNumber).trim().toUpperCase();
-    if (registrationNumber !== undefined) update.registrationNumber = String(registrationNumber).trim().toUpperCase();
-    if (smlChassis        !== undefined) update.smlChassis         = smlChassis ? String(smlChassis).trim() : null;
-    if (trackerVendor     !== undefined) update.trackerVendor      = String(trackerVendor).trim().toLowerCase();
-    if (route             !== undefined) update.route              = String(route).trim();
-    if (institution       !== undefined) update.institution        = String(institution).trim().toLowerCase();
-    if (active            !== undefined) update.active             = Boolean(active);
-
-    // IMEI change — requires uniqueness check
-    if (imei !== undefined) {
-      const imeiStr = String(imei).trim();
-      if (!/^\d{10,17}$/.test(imeiStr)) {
-        return res.status(400).json({ success: false, error: "imei must be 10–17 digits" });
-      }
-      const currentImei = doc.data().imei;
-      if (imeiStr !== currentImei) {
-        // Check against in-memory cache
-        const occupiedBy = BusCache.getBusId(imeiStr);
-        if (occupiedBy && occupiedBy !== busId) {
-          return res.status(409).json({ success: false, error: `IMEI ${imeiStr} already assigned to ${occupiedBy}` });
-        }
-        // Check Firestore for concurrent writes
-        const conflict = await admin.firestore().collection("buses")
-          .where("imei", "==", imeiStr).limit(1).get();
-        if (!conflict.empty && conflict.docs[0].id !== busId) {
-          return res.status(409).json({ success: false, error: `IMEI ${imeiStr} already exists` });
-        }
-      }
-      update.imei = imeiStr;
-    }
-
-    if (Object.keys(update).length === 1) { // only updatedAt
-      return res.status(400).json({ success: false, error: "No fields to update" });
-    }
-
-    await admin.firestore().collection("buses").doc(busId).update(update);
-
-    // Mirror rtoNumber change into settings/rtoMapping for Flutter RoutesCache
-    if (update.rtoNumber !== undefined) {
-      await admin.firestore().collection("settings").doc("rtoMapping").set(
-        { [busId]: update.rtoNumber || "" },
-        { merge: true }
-      );
-    }
-
-    // Reload in-memory cache immediately
-    await reloadBusCache();
-
-    console.log(`🚌 Bus UPDATED: ${busId} fields=${Object.keys(update).filter(k => k !== "updatedAt").join(",")}`);
-    const updated = await admin.firestore().collection("buses").doc(busId).get();
-    return res.json({ success: true, busId, bus: { busId, ...updated.data() } });
-  } catch (e) {
-    console.log("PATCH /admin/buses error:", e.message);
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// DELETE /admin/buses/:busId — soft deactivate (active = false)
-// Hard delete is not performed because historical attendance/trip_logs/bus_km_history
-// reference busId as a plain string. Setting active=false removes the bus from live
-// GPS tracking while preserving all historical records.
-app.delete("/admin/buses/:busId", adminAuth, async (req, res) => {
-  try {
-    const busId = normalizeBusId(req.params.busId);
-    const doc = await admin.firestore().collection("buses").doc(busId).get();
-    if (!doc.exists) {
-      return res.status(404).json({ success: false, error: `Bus ${busId} not found` });
-    }
-
-    const force = req.query.force === "true" && req.adminRole === "superadmin";
-
-    if (force) {
-      // Hard delete — superadmin only, used to clean up test/duplicate entries
-      await admin.firestore().collection("buses").doc(busId).delete();
-      await reloadBusCache();
-      console.log(`🚌 Bus HARD-DELETED: ${busId} by superadmin`);
-      return res.json({ success: true, busId, deleted: true });
-    }
-
-    // Default: soft deactivate
-    await admin.firestore().collection("buses").doc(busId).update({
-      active: false,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    await reloadBusCache();
-
-    console.log(`🚌 Bus DEACTIVATED: ${busId}`);
-    return res.json({ success: true, busId, deactivated: true, message: `${busId} deactivated. Historical data preserved.` });
-  } catch (e) {
-    console.log("DELETE /admin/buses error:", e.message);
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-  
-/* ==========================================================================
-   BUS RENAME — Atomic migration: oldBusId → newBusId
-   POST /admin/buses/:busId/rename   { newBusId: "BUS-8" }
-   POST /admin/buses/:busId/rollback-rename
-
-   Migrates:
-     buses/{oldId}            → deactivated (active:false, renamedTo)
-     buses/{newId}            → created (copy of old fields, active:true)
-     routes[].busId           → updated in batch
-     students/faculty/parents[].busId → updated in chunks of 400
-     bus_tokens               → tokens transferred old→new
-     settings/rtoMapping      → new entry added
-     BusCache                 → reloaded
-     Redis route cache        → invalidated
-
-   Historical collections (attendance/trip_logs/bus_km_history/boarding_logs)
-   are NOT touched — historical records permanently keep the old busId string.
-   ========================================================================== */
-
-// ── Helper: batch-update busId field across a single Firestore collection ──
-async function _renameBusIdInCollection(db, collectionName, oldId, newId, chunkSize = 400) {
-  let updated = 0;
-  let lastDoc = null;
-
-  while (true) {
-    let q = db.collection(collectionName)
-      .where("busId", "==", oldId)
-      .limit(chunkSize);
-    if (lastDoc) q = q.startAfter(lastDoc);
-
-    const snap = await q.get();
-    if (snap.empty) break;
-
-    const batch = db.batch();
-    snap.docs.forEach(d => batch.update(d.ref, { busId: newId }));
-    await batch.commit();
-
-    updated += snap.docs.length;
-    lastDoc = snap.docs[snap.docs.length - 1];
-    if (snap.docs.length < chunkSize) break;
-  }
-  return updated;
-}
-
-// POST /admin/buses/:busId/rename
-app.post("/admin/buses/:busId/rename", adminAuth, async (req, res) => {
-  const oldId = normalizeBusId(req.params.busId);
-  const { newBusId } = req.body || {};
-
-  if (!newBusId || typeof newBusId !== "string") {
-    return res.status(400).json({ success: false, error: "newBusId is required" });
-  }
-  const newId = normalizeBusId(newBusId);
-
-  if (oldId === newId) {
-    return res.status(400).json({ success: false, error: "newBusId must differ from current busId" });
-  }
-
-  const db = admin.firestore();
-  const summary = {
-    oldId, newId,
-    completedSteps: [],
-    routesUpdated: 0,
-    studentsUpdated: 0,
-    facultyUpdated: 0,
-    parentsUpdated: 0,
-    tokensTransferred: 0,
-  };
-
-  try {
-    // ── Step 1: Validate ────────────────────────────────────────────────────
-    const [oldDoc, newDoc] = await Promise.all([
-      db.collection("buses").doc(oldId).get(),
-      db.collection("buses").doc(newId).get(),
-    ]);
-    if (!oldDoc.exists) {
-      return res.status(404).json({ success: false, error: `Bus ${oldId} not found` });
-    }
-    if (newDoc.exists && newDoc.data().active !== false) {
-      return res.status(409).json({ success: false, error: `Bus ${newId} already exists and is active` });
-    }
-    summary.completedSteps.push("validated");
-
-    // ── Step 2: Create buses/{newId} ───────────────────────────────────────
-    const oldData = oldDoc.data();
-    await db.collection("buses").doc(newId).set({
-      ...oldData,
-      active: true,
-      renamedFrom: oldId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    summary.completedSteps.push("buses_new_created");
-
-    // ── Step 3: Update routes ──────────────────────────────────────────────
-    const routesSnap = await db.collection("routes").where("busId", "==", oldId).get();
-    if (!routesSnap.empty) {
-      const batch = db.batch();
-      routesSnap.docs.forEach(d => batch.update(d.ref, { busId: newId }));
-      await batch.commit();
-      summary.routesUpdated = routesSnap.size;
-    }
-    summary.completedSteps.push("routes_updated");
-
-    // Invalidate in-memory + Redis route cache for both IDs
-    delete routeCache[oldId];
-    delete routeCache[newId];
-    routeGraphCache && delete routeGraphCache[oldId];
-    routeGraphCache && delete routeGraphCache[newId];
-    try { await redis.del(`route:${oldId}`); await redis.del(`route:${newId}`); } catch (_) {}
-    // Also clear institution-specific route cache keys
-    try {
-      await redis.del(`route:${oldId}:college`); await redis.del(`route:${oldId}:school`);
-      await redis.del(`route:${newId}:college`); await redis.del(`route:${newId}:school`);
-    } catch (_) {}
-
-    // ── Step 4: Migrate users ──────────────────────────────────────────────
-    summary.studentsUpdated = await _renameBusIdInCollection(db, "students", oldId, newId);
-    summary.facultyUpdated  = await _renameBusIdInCollection(db, "faculty",  oldId, newId);
-    summary.parentsUpdated  = await _renameBusIdInCollection(db, "parents",  oldId, newId);
-    summary.completedSteps.push("users_migrated");
-
-    // ── Step 5: Transfer bus_tokens ────────────────────────────────────────
-    const oldTokenDoc = await db.collection("bus_tokens").doc(oldId).get();
-    const tokens = oldTokenDoc.exists ? (oldTokenDoc.data().tokens || []) : [];
-    if (tokens.length > 0) {
-      await db.collection("bus_tokens").doc(newId).set(
-        { busId: newId, tokens: admin.firestore.FieldValue.arrayUnion(...tokens) },
-        { merge: true }
-      );
-      await db.collection("bus_tokens").doc(oldId).update({ tokens: [] });
-      summary.tokensTransferred = tokens.length;
-    }
-    summary.completedSteps.push("tokens_transferred");
-
-    // ── Step 6: Deactivate old bus document ────────────────────────────────
-    await db.collection("buses").doc(oldId).update({
-      active: false,
-      renamedTo: newId,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    summary.completedSteps.push("old_bus_deactivated");
-
-    // ── Step 7: Update settings/rtoMapping ────────────────────────────────
-    const rtoVal = oldData.rtoNumber || "";
-    if (rtoVal) {
-      await db.collection("settings").doc("rtoMapping").set(
-        { [newId]: rtoVal },
-        { merge: true }
-      );
-    }
-    summary.completedSteps.push("rto_mapping_updated");
-
-    // ── Step 8: Reload BusCache + clear unknown IMEI log ──────────────────
-    _unknownImeiLogged.clear();
-    await reloadBusCache();
-    // Remove stale old-busId entry from live bus cache so it stops appearing
-    // in WebSocket broadcasts immediately (otherwise it persists for ~5 min).
-    delete _lastKnownBuses[oldId];
-    summary.completedSteps.push("bus_cache_reloaded");
-
-    console.log(`🔀 Bus RENAMED: ${oldId} → ${newId} | routes=${summary.routesUpdated} students=${summary.studentsUpdated} faculty=${summary.facultyUpdated} parents=${summary.parentsUpdated} tokens=${summary.tokensTransferred}`);
-    return res.json({ success: true, ...summary });
-
-  } catch (e) {
-    console.log(`❌ Bus rename error at step after [${summary.completedSteps.slice(-1)[0] || "start"}]: ${e.message}`);
-    return res.status(500).json({
-      success: false,
-      error: e.message,
-      completedSteps: summary.completedSteps,
-      partialSummary: summary,
-      rollbackHint: `POST /admin/buses/${oldId}/rollback-rename with { "newBusId": "${newId}" }`,
-    });
-  }
-});
-
-// POST /admin/buses/:busId/rollback-rename  { newBusId: "BUS-8" }
-// Reverts a rename operation. Safe to call multiple times (idempotent).
-app.post("/admin/buses/:busId/rollback-rename", adminAuth, async (req, res) => {
-  const oldId = normalizeBusId(req.params.busId);   // original id e.g. BUS-4
-  const { newBusId } = req.body || {};
-
-  if (!newBusId) {
-    return res.status(400).json({ success: false, error: "newBusId required (the id that was being renamed to)" });
-  }
-  const newId = normalizeBusId(newBusId);
-  const db = admin.firestore();
-  const summary = { oldId, newId, completedSteps: [] };
-
-  try {
-    // Revert routes: BUS-8 → BUS-4
-    const routesSnap = await db.collection("routes").where("busId", "==", newId).get();
-    if (!routesSnap.empty) {
-      const batch = db.batch();
-      routesSnap.docs.forEach(d => batch.update(d.ref, { busId: oldId }));
-      await batch.commit();
-      summary.routesReverted = routesSnap.size;
-    }
-    summary.completedSteps.push("routes_reverted");
-
-    // Revert users: BUS-8 → BUS-4
-    summary.studentsReverted = await _renameBusIdInCollection(db, "students", newId, oldId);
-    summary.facultyReverted  = await _renameBusIdInCollection(db, "faculty",  newId, oldId);
-    summary.parentsReverted  = await _renameBusIdInCollection(db, "parents",  newId, oldId);
-    summary.completedSteps.push("users_reverted");
-
-    // Revert bus_tokens
-    const newTokenDoc = await db.collection("bus_tokens").doc(newId).get();
-    const tokens = newTokenDoc.exists ? (newTokenDoc.data().tokens || []) : [];
-    if (tokens.length > 0) {
-      await db.collection("bus_tokens").doc(oldId).set(
-        { busId: oldId, tokens: admin.firestore.FieldValue.arrayUnion(...tokens) },
-        { merge: true }
-      );
-      await db.collection("bus_tokens").doc(newId).update({ tokens: [] });
-    }
-    summary.completedSteps.push("tokens_reverted");
-
-    // Reactivate old bus document
-    await db.collection("buses").doc(oldId).update({
-      active: true,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    // Mark new doc as rolled back (do not delete — may have received GPS data)
-    const newDocRef = db.collection("buses").doc(newId);
-    const newDocSnap = await newDocRef.get();
-    if (newDocSnap.exists) {
-      await newDocRef.update({ active: false, rolledBack: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
-    }
-    summary.completedSteps.push("bus_docs_reverted");
-
-    // Invalidate caches
-    delete routeCache[oldId]; delete routeCache[newId];
-    routeGraphCache && delete routeGraphCache[oldId];
-    routeGraphCache && delete routeGraphCache[newId];
-    try {
-      await redis.del(`route:${oldId}`); await redis.del(`route:${newId}`);
-      await redis.del(`route:${oldId}:college`); await redis.del(`route:${oldId}:school`);
-      await redis.del(`route:${newId}:college`); await redis.del(`route:${newId}:school`);
-    } catch (_) {}
-
-    _unknownImeiLogged.clear();
-    await reloadBusCache();
-    // Remove stale new-busId entry from live bus cache
-    delete _lastKnownBuses[newId];
-    // Remove the newBusId entry from settings/rtoMapping (added during rename)
-    try {
-      await db.collection("settings").doc("rtoMapping").update({
-        [newId]: admin.firestore.FieldValue.delete(),
-      });
-    } catch (_) {} // ignore if key didn't exist
-    summary.completedSteps.push("cache_reloaded");
-
-    console.log(`↩️  Bus rename ROLLED BACK: ${newId} → ${oldId}`);
-    return res.json({ success: true, ...summary });
-
-  } catch (e) {
-    console.log(`❌ Rollback error: ${e.message}`);
-    return res.status(500).json({
-      success: false,
-      error: e.message,
-      completedSteps: summary.completedSteps,
-    });
-  }
-});
-
 // ── Update bus driver/route info → Firebase buses/{busId} ─────────────────
 app.put("/admin/bus/:busId", adminAuth, async (req, res) => {
   try {
     const { busId } = req.params;
-    const {
-      driverName, driverMobile, route, rtoNumber,
-      imei, active, registrationNumber, busNumber, smlChassis, trackerVendor, institution,
-    } = req.body;
+    const { driverName, driverMobile, route, rtoNumber } = req.body;
 
     if (!busId) {
       return res.status(400).json({ success: false, error: "busId required" });
     }
 
     const update = {};
-    if (driverName        !== undefined) update.driverName         = String(driverName).trim();
-    if (driverMobile      !== undefined) update.driverMobile       = String(driverMobile).trim();
-    if (route             !== undefined) update.route              = String(route).trim();
-    if (rtoNumber         !== undefined) update.rtoNumber          = String(rtoNumber).trim().toUpperCase();
-    if (registrationNumber !== undefined) update.registrationNumber = String(registrationNumber).trim().toUpperCase();
-    if (busNumber         !== undefined) update.busNumber          = String(busNumber).trim();
-    if (smlChassis        !== undefined) update.smlChassis         = smlChassis ? String(smlChassis).trim() : null;
-    if (trackerVendor     !== undefined) update.trackerVendor      = String(trackerVendor).trim().toLowerCase();
-    if (institution       !== undefined) update.institution        = String(institution).trim().toLowerCase();
-    if (active            !== undefined) update.active             = Boolean(active);
-
-    // IMEI change — validate and check uniqueness
-    if (imei !== undefined) {
-      const imeiStr = String(imei).trim();
-      if (!/^\d{10,17}$/.test(imeiStr)) {
-        return res.status(400).json({ success: false, error: "imei must be 10–17 digits" });
-      }
-      const occupiedBy = BusCache.getBusId(imeiStr);
-      if (occupiedBy && occupiedBy !== normalizeBusId(busId)) {
-        return res.status(409).json({ success: false, error: `IMEI ${imeiStr} already assigned to ${occupiedBy}` });
-      }
-      update.imei = imeiStr;
-    }
+    if (driverName  !== undefined) update.driverName   = driverName;
+    if (driverMobile !== undefined) update.driverMobile = driverMobile;
+    if (route        !== undefined) update.route        = route;
+    if (rtoNumber    !== undefined) update.rtoNumber    = rtoNumber;
 
     if (!Object.keys(update).length) {
       return res.status(400).json({ success: false, error: "No fields to update" });
@@ -4966,21 +4288,18 @@ app.put("/admin/bus/:busId", adminAuth, async (req, res) => {
 
     await admin.firestore()
       .collection("buses")
-      .doc(normalizeBusId(busId))
+      .doc(busId)
       .set(update, { merge: true });
 
-    // Mirror rtoNumber into unified RTO mapping doc (used by Flutter RoutesCache)
+    // Also update the unified RTO mapping document
     if (rtoNumber !== undefined) {
       await admin.firestore().collection("settings").doc("rtoMapping").set(
-        { [normalizeBusId(busId)]: rtoNumber || "" },
+        { [busId]: rtoNumber || "" },
         { merge: true }
       );
     }
 
-    // Reload in-memory cache so next GPS packet uses updated values
-    await reloadBusCache();
-
-    return res.json({ success: true, busId: normalizeBusId(busId), updated: update });
+    return res.json({ success: true, busId, updated: update });
   } catch (e) {
     console.log("BUS UPDATE ERROR:", e);
     return res.status(500).json({ success: false, error: e.message });
@@ -5109,8 +4428,8 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
       const imei = (payload.imei || "").toString().trim();
       if (!imei) { rejected++; continue; }
 
-      // IMEI must be mapped in busCache
-      const busId = BusCache.getBusId(imei);
+      // IMEI must be mapped in busMap
+      const busId = busMap[imei];
       if (!busId) {
         if (!_tataLatestState[imei]) console.log(`[TATA] Unknown IMEI ignored: ${imei}`);
         unmapped++;
@@ -5166,7 +4485,7 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
       // Build canonical bus object
       const normalizedBus = {
         busId,
-        driver: BusCache.getDriver(busId),
+        driver: driverMap[busId] || "N/A",
         route: routeGraph?.routeName || "N/A",
         routeType: routeGraph?.routeType || "college",
         currentCity: routeInfo?.currentCity || null,
@@ -5175,7 +4494,7 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
         nextCityDistance: routeInfo?.distanceToNext != null ? Number(routeInfo.distanceToNext.toFixed(2)) : null,
         routeDirection: routeInfo?.direction || null,
         imei, lat, lng, speed,
-        driverMobile: BusCache.getDriverMobile(busId),
+        driverMobile: driverMobileMap[busId] || "N/A",
         startTime: busStartTimes[busId]?.time || null,
         todayKm: busDistanceTracker[busId]?.totalKm?.toFixed(2) || "0",
         collegeArrivalTime: busCollegeArrival[busId]?.time || null,
@@ -5240,7 +4559,7 @@ app.post("/tata/push", express.raw({ type: "*/*", limit: "1mb" }), async (req, r
 app.get("/tata/push", (req, res) => {
   const vehicles = Object.entries(_tataLatestState).map(([imei, entry]) => ({
     imei,
-    busId: BusCache.getBusId(imei) || "unknown",
+    busId: busMap[imei] || "unknown",
     receivedAt: entry.receivedAt,
     lat: entry.normalizedBus?.lat,
     lng: entry.normalizedBus?.lng,
