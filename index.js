@@ -166,7 +166,7 @@ const serviceAccount = require("./serviceAccountKey.json");
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
-    storageBucket: "scep-bus.firebasestorage.app",
+    storageBucket: "bus-tracker-b34eb.firebasestorage.app",
   });
 }
 console.log("Firebase Storage Bucket:", admin.storage().bucket().name);
@@ -757,7 +757,7 @@ const busMap = {
   "868329089729648": "BUS-11",
   "868329089734846": "BUS-12",
   "860560064978408": "BUS-10",
-  "860560065510150": "BUS-20",
+  "860560065510150": "BUS-14",
   "860560067136350": "BUS-7",
   "866334078434509": "BUS-5",
   "862567077140767": "BUS-6",
@@ -6075,7 +6075,7 @@ async function cleanupUser(collectionName, docId) {
     // 2. Delete Firebase Storage photo
     if (passPhotoPath) {
       try {
-        const bucket = admin.storage().bucket("scep-bus.firebasestorage.app");
+        const bucket = admin.storage().bucket("bus-tracker-b34eb.firebasestorage.app");
         await bucket.file(passPhotoPath).delete();
         results.storage = true;
         log("Storage photo deleted: " + passPhotoPath);
@@ -6083,7 +6083,7 @@ async function cleanupUser(collectionName, docId) {
     } else if (uid) {
       // Try default path even if passPhotoPath not stored
       try {
-        const bucket = admin.storage().bucket("scep-bus.firebasestorage.app");
+        const bucket = admin.storage().bucket("bus-tracker-b34eb.firebasestorage.app");
         await bucket.file(`bus-pass-photos/${uid}/profile.jpg`).delete();
         results.storage = true;
         log("Storage photo deleted (default path)");
@@ -9065,7 +9065,7 @@ app.post("/api/bus-pass/photo-upload", upload.single("photo"), authenticateFireb
     // client as the UX requirement, but there is no server-side count cap.
     let count = d.photoChangeCount || 0;
     // Upload via Admin SDK ONLY (client has zero Storage access)
-    const bucket = admin.storage().bucket("scep-bus.firebasestorage.app");
+    const bucket = admin.storage().bucket("bus-tracker-b34eb.firebasestorage.app");
     const filePath = `bus-pass-photos/${req.firebaseUid}/profile.jpg`;
     const file = bucket.file(filePath);
     console.log("[BACKEND 5] bucket:", bucket.name, "path:", filePath);
@@ -9134,7 +9134,7 @@ app.get("/api/bus-pass/photo-url/:studentId", async (req, res) => {
     }
     if (!authorized) return res.status(403).json({ error: "Access denied" });
     if (!d.passPhotoPath) return res.json({ success: true, photoUrl: null });
-    const bucket = admin.storage().bucket("scep-bus.firebasestorage.app");
+    const bucket = admin.storage().bucket("bus-tracker-b34eb.firebasestorage.app");
     const [exists] = await bucket.file(d.passPhotoPath).exists();
     if (!exists) return res.json({ success: true, photoUrl: null });
     const [url] = await bucket.file(d.passPhotoPath).getSignedUrl({ action: "read", expires: Date.now() + 7*24*60*60*1000 });
