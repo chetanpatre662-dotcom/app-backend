@@ -750,6 +750,27 @@ const SML_API = {
    seeds below are used so GPS tracking never goes dark.
    ========================================================================== */
 
+// ── AUTHORITATIVE GPS device → bus mapping (FINAL — do not edit/reorder) ──
+// This mapping ALWAYS wins over Firestore `imei` fields and over _BC_SEEDS.
+const busMap = {
+  "868329089743334": "BUS-8",
+  "868329089729648": "BUS-11",
+  "868329089734846": "BUS-12",
+  "860560064978408": "BUS-10",
+  "860560065510150": "BUS-20",
+  "860560067136350": "BUS-7",
+  "866334078434509": "BUS-5",
+  "862567077140767": "BUS-6",
+  "869860089492893": "BUS-2",
+  "869372084048852": "BUS-1",
+};
+// SML chassis → device IMEI (from the final production backend's smlBusMap).
+// The bus for each chassis is always resolved through busMap above.
+const _SML_CHASSIS_IMEI = {
+  MBUZT54XBK0325975: "866334078434509",
+  MBUZT54XEK0331171: "862567077140767",
+  MBUZT54XGL0317250: "860560067136350",
+};
 // ── Hardcoded seeds (fallback only — used when Firestore is unavailable) ──
 const _BC_SEEDS = [
   { busId: "BUS-1",  imei: "869372084048852", driverName: "",              driverMobile: "",             smlChassis: null,            active: true },
@@ -763,6 +784,12 @@ const _BC_SEEDS = [
   { busId: "BUS-14", imei: "862567077140767", driverName: "Shyam",         driverMobile: "9876543216",   smlChassis: "MBUZT54XEK0331171", active: true },
   { busId: "BUS-15", imei: "866334078434509", driverName: "Yogesh Matre",  driverMobile: "9876543217",   smlChassis: "MBUZT54XBK0325975", active: true },
 ];
+// Align seed imei/smlChassis with the authoritative mapping (seeds above
+// pre-date it and paired several devices with the wrong bus).
+for (const s of _BC_SEEDS) {
+  s.imei = Object.keys(busMap).find(i => busMap[i] === s.busId) || "";
+  s.smlChassis = Object.keys(_SML_CHASSIS_IMEI).find(c => _SML_CHASSIS_IMEI[c] === s.imei) || null;
+}
 
 // ── In-memory lookup tables (rebuilt by loadBusCache / reloadBusCache) ────
 let _bc_imeiToBusId  = {};   // imei      → busId
@@ -781,6 +808,11 @@ function _bc_buildFromArray(buses) {
     if (b.driverMobile) mobileMap[b.busId]   = b.driverMobile;
     if (b.smlChassis) smlMap[b.smlChassis]   = { imei: b.imei || "", busId: b.busId };
     allMap[b.busId] = b;
+  }
+  // Authoritative mapping always takes priority over Firestore/seed values.
+  for (const [imei, busId] of Object.entries(busMap)) imeiMap[imei] = busId;
+  for (const [chassis, imei] of Object.entries(_SML_CHASSIS_IMEI)) {
+    smlMap[chassis] = { imei, busId: busMap[imei] };
   }
   _bc_imeiToBusId  = imeiMap;
   _bc_driverMap    = driverMap;
@@ -835,8 +867,9 @@ async function _bc_seedMissingToFirestore(existingBuses) {
     const existing = existingMap.get(s.busId);
 
     if (!existing) {
-      // Document does not exist at all — create it with full seed data
-      const { busId, ...fields } = s;
+      // Document does not exist at all — create it with seed data.
+      // imei/smlChassis are NOT written: device mapping lives in busMap.
+      const { busId, imei: _i, smlChassis: _c, ...fields } = s;
       writes.push(
         db.collection("buses").doc(busId).set({
           ...fields,
@@ -849,10 +882,9 @@ async function _bc_seedMissingToFirestore(existingBuses) {
 
     // Document exists — only merge fields that are genuinely missing
     // (undefined or null). Never overwrite fields the admin has set.
+    // Device fields (imei/smlChassis) are no longer patched from seeds —
+    // the authoritative busMap in code resolves every device.
     const patch = {};
-    if (!existing.imei       && s.imei)       patch.imei       = s.imei;
-    if (!existing.smlChassis && s.smlChassis) patch.smlChassis = s.smlChassis;
-
     if (Object.keys(patch).length > 0) {
       patch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
       writes.push(db.collection("buses").doc(s.busId).update(patch));
@@ -869,7 +901,7 @@ async function _bc_seedMissingToFirestore(existingBuses) {
 async function _bc_seedAllToFirestore() {
   const db = admin.firestore();
   await Promise.all(_BC_SEEDS.map(s => {
-    const { busId, ...fields } = s;
+    const { busId, imei: _i, smlChassis: _c, ...fields } = s;
     return db.collection("buses").doc(busId).set({
       ...fields,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5843,6 +5875,48 @@ app.post("/admin/send-notification-institution", adminAuth, async (req, res) => 
   }
 });
 
+/* Adds read-only `accountCreatedAt` (ISO string | null) to each user doc.
+   Source of truth: Firebase Authentication metadata.creationTime, looked up in
+   batches of 100 via admin.auth().getUsers() (never one call per user).
+   Falls back to the Firestore `createdAt` / `created_at` field only when the
+   user has no Auth account. Never invents a date; null when unknown.
+   Only the timestamp is exposed - no other Firebase Auth data is returned. */
+async function attachAccountCreatedAt(...lists) {
+  const users = lists.flat();
+  const byUid = new Map();
+  const byEmail = new Map();
+  try {
+    const ids = [];
+    const seen = new Set();
+    for (const u of users) {
+      if (u.uid && !seen.has("u:" + u.uid)) { seen.add("u:" + u.uid); ids.push({ uid: u.uid }); }
+      else if (!u.uid && u.email && !seen.has("e:" + u.email)) { seen.add("e:" + u.email); ids.push({ email: u.email }); }
+    }
+    for (let i = 0; i < ids.length; i += 100) {
+      const r = await admin.auth().getUsers(ids.slice(i, i + 100));
+      for (const a of r.users) {
+        const t = a.metadata && a.metadata.creationTime;
+        if (!t) continue;
+        byUid.set(a.uid, t);
+        if (a.email) byEmail.set(a.email.toLowerCase(), t);
+      }
+    }
+  } catch (e) {
+    console.log("attachAccountCreatedAt: Auth lookup failed:", e.message);
+  }
+  const toIso = (v) => {
+    if (v === null || v === undefined || v === "") return null;
+    let d;
+    if (typeof v.toDate === "function") d = v.toDate();
+    else if (typeof v === "object" && (v._seconds != null || v.seconds != null)) d = new Date((v._seconds ?? v.seconds) * 1000);
+    else d = new Date(v);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  };
+  for (const u of users) {
+    const authTime = (u.uid && byUid.get(u.uid)) || (u.email && byEmail.get(String(u.email).toLowerCase())) || null;
+    u.accountCreatedAt = toIso(authTime) || toIso(u.createdAt) || toIso(u.created_at);
+  }
+}
 /* =========================
    ADMIN USERS API — INSTITUTION FILTERED (RBAC-aware)
    GET /admin/users-by-institution?institution=college|school
@@ -5863,6 +5937,7 @@ app.get("/admin/users-by-institution", adminAuth, async (req, res) => {
       const students = studentsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
       const parents  = parentsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
       const faculty  = facultySnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      await attachAccountCreatedAt(students, parents, faculty);
       return res.json({ success: true, institution: "all", students, parents, faculty,
         counts: { students: students.length, parents: parents.length, faculty: faculty.length, total: students.length + parents.length + faculty.length } });
     }
@@ -5885,6 +5960,7 @@ app.get("/admin/users-by-institution", adminAuth, async (req, res) => {
     const parents  = parentsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const faculty  = facultySnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
+    await attachAccountCreatedAt(students, parents, faculty);
     return res.json({
       success: true,
       institution: inst,
