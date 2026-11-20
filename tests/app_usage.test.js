@@ -373,13 +373,19 @@ test("shared login: Appcount initial login -> session cookie only, forced passwo
     assert.equal(r.json.token, undefined, "no token in the body");
     assert.match(r.setCookie, /HttpOnly/i);
     assert.match(r.setCookie, /SameSite=Strict/i);
-    assert.match(r.setCookie, /Path=\/app-usage/);
+    // public browser path (Nginx strips /api, so it must NOT be derived from the server-side URL)
+    assert.match(r.setCookie, /Path=\/api\/app-usage(;|$)/);
     const sess = await s.call("GET", "/admin/session", { token: r.cookie });
     assert.deepEqual([sess.status, sess.json.role, sess.json.mustChangePassword], [200, "appcount", true]);
     assert.equal((await s.call("GET", "/admin/report", { token: r.cookie })).status, 403);
     assert.equal((await s.call("GET", "/admin/export", { token: r.cookie })).status, 403);
-    // nothing was written to Firestore by merely logging in (no plaintext password anywhere)
-    assert.equal(s.db.docs.has("appUsageAdmin/credentials"), false);
+    // first successful login initialised the record: hash only, forced change, version 1
+    const doc = s.db.docs.get("appUsageAdmin/credentials").data;
+    assert.ok(doc.passwordHash.startsWith("$2"));
+    assert.equal(doc.mustChangePassword, true);
+    assert.equal(doc.tokenVersion, 1);
+    assert.equal(doc.password, undefined);
+    assert.ok(!r.text.includes("$2"), "hash never in a response");
   } finally {
     s.close();
   }
@@ -750,4 +756,112 @@ test("profileSnapshot legacy docs (no institution)", () => {
   assert.equal(mod.profileSnapshot("students", { name: "A", uid: "u" }).institution, "college");
   assert.equal(mod.profileSnapshot("faculty", { name: "A", facultyType: "School" }).institution, "school");
   assert.equal(mod.profileSnapshot("parents", { name: "A" }).institution, "unknown");
+});
+
+// ───────────────────────── credential bootstrap + session loop regression ─────────────────────────
+test("bootstrap: record absent + WRONG password creates nothing; unknown names create nothing", async () => {
+  const s = await setup();
+  try {
+    assert.equal((await loginInitial(s, "wrong")).status, 401);
+    assert.equal((await loginInitial(s, "Appcount", "someone")).status, 401);
+    assert.equal((await s.call("GET", "/admin/session")).status, 401);
+    assert.equal(s.db.docs.has("appUsageAdmin/credentials"), false);
+  } finally {
+    s.close();
+  }
+});
+
+test("bootstrap: record absent + correct .env password -> exactly one record, session accepted, forced change", async () => {
+  const s = await setup();
+  try {
+    const r = await loginInitial(s);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.mustChangePassword, true);
+    const keys = [...s.db.docs.keys()].filter((k) => k.startsWith("appUsageAdmin/"));
+    assert.deepEqual(keys, ["appUsageAdmin/credentials"]);
+    // the regression: the dashboard's session check must accept the cookie from login
+    const sess = await s.call("GET", "/admin/session", { token: r.cookie });
+    assert.equal(sess.status, 200);
+    assert.equal(sess.json.mustChangePassword, true);
+    // logging in again with the initial password reuses the record (no second write, still forced change)
+    const before = JSON.stringify(s.db.docs.get("appUsageAdmin/credentials").data);
+    const again = await loginInitial(s);
+    assert.equal(again.status, 200);
+    assert.equal(again.json.mustChangePassword, true);
+    assert.equal(JSON.stringify(s.db.docs.get("appUsageAdmin/credentials").data), before);
+  } finally {
+    s.close();
+  }
+});
+
+test("bootstrap: concurrent first logins create ONE record and all get valid sessions", async () => {
+  const s = await setup();
+  try {
+    const rs = await Promise.all([1, 2, 3, 4].map(() => loginInitial(s)));
+    assert.ok(rs.every((r) => r.status === 200), rs.map((r) => r.status).join());
+    assert.equal([...s.db.docs.keys()].filter((k) => k.startsWith("appUsageAdmin/")).length, 1);
+    for (const r of rs) assert.equal((await s.call("GET", "/admin/session", { token: r.cookie })).status, 200);
+  } finally {
+    s.close();
+  }
+});
+
+test("bootstrap: an existing record is never overwritten and wins over the .env password", async () => {
+  const s = await setup();
+  try {
+    const hash = await bcrypt.hash("Existing9Password", 4);
+    const existing = { username: "Appcount", passwordHash: hash, mustChangePassword: false, tokenVersion: 7 };
+    await s.db.collection("appUsageAdmin").doc("credentials").set(existing);
+    assert.equal((await loginInitial(s, "Appcount")).status, 401);
+    assert.deepEqual(s.db.docs.get("appUsageAdmin/credentials").data, existing);
+    const ok = await loginInitial(s, "Existing9Password");
+    assert.equal(ok.status, 200);
+    assert.equal(ok.json.mustChangePassword, false);
+    assert.equal((await s.call("GET", "/admin/report", { token: ok.cookie })).status, 200);
+  } finally {
+    s.close();
+  }
+});
+
+test("full first-login flow: bootstrap -> change -> logout -> old dead, new works, survives restart", async () => {
+  const s = await setup();
+  const db = s.db, clock = s.clock;
+  try {
+    const first = await loginInitial(s);
+    const ch = await s.call("POST", "/admin/change-password", { token: first.cookie, body: { currentPassword: "Appcount", newPassword: NEW_PW } });
+    assert.equal(ch.status, 200);
+    const doc = db.docs.get("appUsageAdmin/credentials").data;
+    assert.deepEqual([doc.mustChangePassword, doc.tokenVersion], [false, 2]);
+    assert.ok(doc.createdAt, "createdAt preserved on change");
+    assert.equal((await s.call("GET", "/admin/session", { token: first.cookie })).status, 401, "pre-change session invalidated");
+    assert.equal((await s.call("POST", "/admin/logout", { token: ch.cookie })).status, 200);
+    assert.equal((await loginInitial(s, "Appcount")).status, 401);
+    assert.equal((await loginInitial(s, NEW_PW)).status, 200);
+  } finally {
+    s.close();
+  }
+  const s2 = await setup({ db, clock });
+  try {
+    assert.equal((await loginInitial(s2, "Appcount")).status, 401);
+    const r = await loginInitial(s2, NEW_PW);
+    assert.equal(r.status, 200);
+    assert.equal((await s2.call("GET", "/admin/report", { token: r.cookie })).status, 200);
+  } finally {
+    s2.close();
+  }
+});
+
+test("cookie path override (APP_USAGE_COOKIE_PATH) and invalid override falls back", async () => {
+  const s = await setup({ env: { APP_USAGE_ADMIN_USERNAME: "Appcount", APP_USAGE_ADMIN_PASSWORD: "Appcount", APP_USAGE_COOKIE_PATH: "/svc/app-usage" } });
+  try {
+    assert.match((await loginInitial(s)).setCookie, /Path=\/svc\/app-usage(;|$)/);
+  } finally {
+    s.close();
+  }
+  const s2 = await setup({ env: { APP_USAGE_ADMIN_USERNAME: "Appcount", APP_USAGE_ADMIN_PASSWORD: "Appcount", APP_USAGE_COOKIE_PATH: "javascript:x" } });
+  try {
+    assert.match((await loginInitial(s2)).setCookie, /Path=\/api\/app-usage(;|$)/);
+  } finally {
+    s2.close();
+  }
 });

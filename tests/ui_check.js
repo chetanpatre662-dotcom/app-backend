@@ -18,6 +18,7 @@ const ORIGIN = `http://127.0.0.1:${PORT}`;
 const LOGIN = `${ORIGIN}/admin/`;
 const USAGE = `${ORIGIN}/admin/app/app-usage.html`;
 const NEW_PW = "Str0ngPassw0rd!";
+const creds = () => getJson(`http://127.0.0.1:${PORT - 1}/__creds`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const getJson = (u) => new Promise((res, rej) => http.get(u, (r) => { let d = ""; r.on("data", (c) => (d += c)); r.on("end", () => { try { res(JSON.parse(d)); } catch (e) { rej(e); } }); }).on("error", rej));
 
@@ -62,6 +63,7 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     await login("Appcount", "wrong");
     ok(await waitFor("document.getElementById('msg').innerText.includes('Invalid')"), "wrong Appcount password -> same existing error");
     ok((await cookies()).length === 0, "no session cookie after failed logins");
+    ok((await creds()).count === 0, "record absent + wrong credentials: no credential record created");
 
     console.log("Normal admin login (unchanged)");
     await login("admin", "adminpass");
@@ -76,7 +78,8 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     console.log("Appcount initial login -> straight to analytics, forced password change");
     await login("Appcount", "Appcount");
     ok(await waitFor("location.pathname==='/admin/app/app-usage.html'", 6000), "Appcount redirected to App Usage Analytics (" + (await url()) + ")");
-    ok(await waitFor("getComputedStyle(document.getElementById('pwForm')).display!=='none'"), "password change screen shown, no second login form");
+    ok(await waitFor("getComputedStyle(document.getElementById('pwForm')).display!=='none'"), "dashboard ACCEPTED the session (no loop): password change screen shown, no second login form");
+    { const r = await creds(); ok(r.count === 1 && r.mustChangePassword === true && r.tokenVersion === 1 && r.hashed, "first login created exactly one record (bcrypt hash, mustChangePassword, v1)"); }
     ok(await ev("!document.getElementById('lgUser') && !document.getElementById('loginForm')"), "separate Appcount login form removed");
     ok(await ev("getComputedStyle(document.getElementById('appWrap')).display==='none'"), "analytics hidden until password changed");
     const ck = (await cookies()).find((c) => c.name === "scep_appusage");
@@ -92,6 +95,7 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     await ev("document.getElementById('pwForm').requestSubmit()");
     ok(await waitFor("getComputedStyle(document.getElementById('appWrap')).display==='block'"), "analytics opens after the password change");
     ok(await tableReady(), "default TODAY cards + table loaded");
+    { const r = await creds(); ok(r.count === 1 && r.mustChangePassword === false && r.tokenVersion === 2, "password change stored (still one record, flag cleared, v2)"); }
     ok((await ev("document.getElementById('fPeriod').value")) === "today", "period defaults to Today");
     ok(await ev("document.getElementById('navDashboard').style.display==='none'"), "Appcount sidebar has no admin Dashboard link");
     await shot("appcount_dashboard");

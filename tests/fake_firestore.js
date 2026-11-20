@@ -69,6 +69,7 @@ class FakeDb {
         },
         set: (r, d) => pending.push(["set", r, d]),
         update: (r, d) => pending.push(["update", r, d]),
+        create: (r, d) => pending.push(["create", r, d]),
       };
       const result = await fn(tx);
       let conflict = false;

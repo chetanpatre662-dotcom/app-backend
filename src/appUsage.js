@@ -11,7 +11,7 @@
  *
  * Collections written (Admin SDK only; the Firestore catch-all rule already denies all client access):
  *   appUsageDaily/{uid}_{YYYY-MM-DD}   one aggregate per user per IST day
- *   appUsageAdmin/credentials          written only when Appcount changes the initial password (bcrypt hash)
+ *   appUsageAdmin/credentials          created on the first successful initial login, updated on password change (bcrypt hash only)
  *
  * Public (Firebase-token) endpoint:   POST /app-usage/open
  * Appcount (shared admin login, HttpOnly cookie session):
@@ -556,8 +556,10 @@ function createAppUsageRouter(deps) {
   //
   // Credential source
   //   * username + INITIAL password: backend environment (APP_USAGE_ADMIN_USERNAME / APP_USAGE_ADMIN_PASSWORD)
-  //   * after the mandatory first change: bcrypt hash in Firestore appUsageAdmin/credentials. From then on
-  //     the environment password is ignored (the .env file is never rewritten at runtime).
+  //   * record missing: the first SUCCESSFUL login with the initial password creates
+  //     appUsageAdmin/credentials (bcrypt hash of it, mustChangePassword: true) in a transaction.
+  //   * after the mandatory change the record holds the new bcrypt hash and the environment password is
+  //     ignored for good (the .env file is never rewritten at runtime).
   //   * deleting that Firestore document re-enables the environment password (+ forced change again).
   const cfg = () => {
     const env = deps.env || process.env;
@@ -602,19 +604,44 @@ function createAppUsageRouter(deps) {
     return { token, ttl };
   }
 
-  // Cookie must be sent to /<prefix>/app-usage/* only (prefix is "/api" in production).
-  function cookiePath(req) {
-    const base = String(req.originalUrl || "").split("?")[0].replace(/\/(admin\/login|app-usage\/.*)$/, "");
-    return (base === "/" ? "" : base) + "/app-usage";
+  // Cookie path = the path the BROWSER uses for the App Usage API (API base ".../api" + "/app-usage").
+  // It must NOT be derived from req.originalUrl: Nginx strips the "/api" prefix before Express sees
+  // the request, so the server-side URL is "/admin/login" while the browser calls "/api/app-usage/...".
+  // (Deriving it produced "Path=/app-usage", the browser never sent the cookie back -> login loop.)
+  // Override with APP_USAGE_COOKIE_PATH only if the public API prefix ever changes.
+  function cookiePath() {
+    const p = String((deps.env || process.env).APP_USAGE_COOKIE_PATH || "").trim();
+    return /^\/[A-Za-z0-9/_-]*$/.test(p) ? p : "/api/app-usage";
   }
   function cookieOptions(req, maxAgeMs) {
     return {
       httpOnly: true,
       sameSite: "strict",
       secure: !!req.secure || (deps.env || process.env).NODE_ENV === "production",
-      path: cookiePath(req),
+      path: cookiePath(),
       maxAge: maxAgeMs,
     };
+  }
+
+  /**
+   * First successful login with the .env initial password while appUsageAdmin/credentials is missing:
+   * create the record (bcrypt hash of the initial password, mustChangePassword: true, tokenVersion: 1)
+   * inside a transaction. Never overwrites: if another request created it first, that record is returned
+   * and the caller re-verifies the password against it.
+   */
+  async function bootstrapCreds(c) {
+    const passwordHash = await bcrypt.hash(c.password, BCRYPT_ROUNDS);
+    const ts = Timestamp.fromMillis(now());
+    const out = await db.runTransaction(async (tx) => {
+      const snap = await tx.get(credRef());
+      if (snap.exists) return { data: snap.data(), created: false };
+      const rec = { username: c.username, passwordHash, mustChangePassword: true, tokenVersion: 1, createdAt: ts, updatedAt: ts };
+      tx.create(credRef(), rec);
+      return { data: rec, created: true };
+    });
+    credCache = { data: out.data, at: now() };
+    if (out.created) log("Appcount credential record initialised (password change required)");
+    return out;
   }
   function parseCookies(header) {
     const out = {};
@@ -640,11 +667,25 @@ function createAppUsageRouter(deps) {
         res.set("Retry-After", String(wait));
         return res.status(429).json({ success: false, error: "Too many login attempts. Try again after 15 minutes." });
       }
-      const doc = await loadCreds();
-      if (!(await verifyPassword(body.password, doc))) {
+      let doc = await loadCreds(true); // always fresh at login (record may have been deleted/changed)
+      const fail = () => {
         loginIpLimiter.hit(ip);
         loginUserLimiter.hit(uKey);
         return next(); // existing admin flow answers with its normal error
+      };
+      if (!(await verifyPassword(body.password, doc))) return fail();
+      if (!doc) {
+        // Password matched the .env initial password and no record exists yet: initialise it.
+        let boot;
+        try {
+          boot = await bootstrapCreds(c);
+        } catch (e) {
+          log("appcount bootstrap error:", e && e.message);
+          return res.status(503).json({ success: false, error: "Could not initialise the App Usage account. Try again." });
+        }
+        doc = boot.data;
+        // Lost a race: someone else created the record; it is authoritative now.
+        if (!boot.created && !(await verifyPassword(body.password, doc))) return fail();
       }
       loginIpLimiter.reset(ip);
       loginUserLimiter.reset(uKey);
@@ -742,15 +783,19 @@ function createAppUsageRouter(deps) {
         return res.status(400).json({ success: false, error: "New password must differ from the initial password" });
       }
       const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-      const tokenVersion = (doc ? doc.tokenVersion || 1 : 0) + 1; // invalidates every older session
-      await credRef().set({
-        username: c.username,
-        passwordHash,
-        mustChangePassword: false,
-        tokenVersion,
-        updatedAt: Timestamp.fromMillis(now()),
+      const seenTv = doc ? doc.tokenVersion || 1 : 0;
+      const ts = Timestamp.fromMillis(now());
+      const changed = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(credRef());
+        const cur = snap.exists ? snap.data() : null;
+        if ((cur ? cur.tokenVersion || 1 : 0) !== seenTv) return false; // changed concurrently
+        const rec = { username: c.username, passwordHash, mustChangePassword: false, tokenVersion: seenTv + 1, updatedAt: ts };
+        if (cur) tx.update(credRef(), rec); // keeps createdAt
+        else tx.set(credRef(), { ...rec, createdAt: ts });
+        return true;
       });
       credCache = null;
+      if (!changed) return res.status(409).json({ success: false, error: "The password was changed in the meantime. Please log in again." });
       const fresh = await loadCreds(true);
       const { token, ttl } = issueToken(stateOf(fresh), "full");
       res.cookie(COOKIE_NAME, token, cookieOptions(req, ttl * 1000));
