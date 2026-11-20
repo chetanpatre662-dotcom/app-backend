@@ -116,8 +116,29 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
       ok(avg.text === (opens / t).toFixed(2), `Avg = total opens / registered (${opens} / ${t} = ${avg.text})`);
       ok(await ev("[...document.querySelectorAll('#cards .stat-value')].every(e=>e.scrollWidth<=e.clientWidth+1)"), "no card value overflows (desktop)");
     }
+    {
+      console.log("Ad impressions");
+      const heads = await ev("[...document.querySelectorAll('.au-table thead th')].map(t=>t.textContent.replace(/\\s+/g,' ').trim())");
+      const want = ["Banner impressions", "Interstitial impressions", "Rewarded impressions", "Total ad impressions"];
+      ok(want.every((w) => heads.includes(w)) && heads.indexOf("Banner impressions") === heads.findIndex((h) => h.startsWith("App opens")) + 1, "4 impression columns right after App opens: " + heads.join(" | "));
+      const api = await ev("fetch(API_BASE+'/app-usage/admin/report'+queryString({pageSize:100})).then(r=>r.json())");
+      const sums = api.rows.reduce((a, r) => { a.b += r.adBanner; a.i += r.adInterstitial; a.r += r.adRewarded; a.t += r.adTotal; a.u += r.adTotal > 0 ? 1 : 0; if (r.adTotal !== r.adBanner + r.adInterstitial + r.adRewarded) a.bad++; return a; }, { b: 0, i: 0, r: 0, t: 0, u: 0, bad: 0 });
+      ok(sums.bad === 0, "every row: total = banner + interstitial + rewarded");
+      ok(api.summary.ads.total === sums.t && api.summary.ads.banner === sums.b && api.summary.ads.interstitial === sums.i && api.summary.ads.rewarded === sums.r && api.summary.ads.usersWithImpressions === sums.u, `summary = table totals (${JSON.stringify(api.summary.ads)})`);
+      const shown = await ev("Object.fromEntries([...document.querySelectorAll('[data-adcard]')].map(e=>[e.dataset.adcard,Number(e.textContent.replace(/,/g,''))]))");
+      ok(shown.total === sums.t && shown.banner === sums.b && shown.interstitial === sums.i && shown.rewarded === sums.r && shown.usersWithImpressions === sums.u, "summary cards show the same numbers: " + JSON.stringify(shown));
+      ok(api.rows.some((r) => r.adTotal === 0) && api.rows.length === api.total, "zero-impression users still listed (" + api.rows.filter((r) => r.adTotal === 0).length + " of " + api.total + ")");
+      const first = await ev("(()=>{const tr=document.querySelector('#tbody tr');return ['adBanner','adInterstitial','adRewarded','adTotal'].map(k=>Number(tr.querySelector('[data-col='+k+']').textContent.replace(/,/g,'')))})()");
+      const r0 = api.rows[0];
+      ok(JSON.stringify(first) === JSON.stringify([r0.adBanner, r0.adInterstitial, r0.adRewarded, r0.adTotal]), "first table row shows its own impression counts " + JSON.stringify(first));
+      ok(await ev("[...document.querySelectorAll('#adCards .stat-value')].every(e=>e.scrollWidth<=e.clientWidth+1)"), "no ad card overflow");
+    }
     await setVal("fInstitution", "school"); await sleep(500); await tableReady();
     ok((await card("college")).text === "0 / 0", "institution=school: College card 0 / 0");
+    {
+      const api = await ev("fetch(API_BASE+'/app-usage/admin/report'+queryString({pageSize:100})).then(r=>r.json())");
+      ok(api.rows.every((r) => r.institution === "school") && api.summary.ads.total === api.rows.reduce((a, r) => a + r.adTotal, 0), "institution filter applies to impressions (" + api.summary.ads.total + ")");
+    }
     ok(ratio((await card("school")).text)[1] === ratio((await card("users")).text)[1], "institution=school: School registered = App Users registered");
     await setVal("fInstitution", "all");
     await setVal("fPeriod", "date"); await setVal("fDate", "2020-01-01"); await sleep(600); await tableReady();
@@ -133,6 +154,13 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     const csv = await ev("fetch(API_BASE+'/app-usage/admin/export'+queryString()).then(async r=>({s:r.status,t:await r.text()}))");
     ok(csv.s === 200 && csv.t.includes("App Open Count"), "CSV export works with the cookie session");
     ok(/Summary,Active Users,Registered Users\r\nApp Users,\d+,100\r\n/.test(csv.t), "CSV contains active / registered summary");
+    {
+      const api = await ev("fetch(API_BASE+'/app-usage/admin/report'+queryString({pageSize:100,page:1})).then(r=>r.json())");
+      const rows = csv.t.replace("\uFEFF", "").split("\r\n\r\n")[0].trim().split("\r\n").slice(1);
+      const csvTotal = rows.reduce((a, l) => a + Number(l.split(",")[11]), 0);
+      const m = csv.t.match(/Total Ad Impressions,(\d+)\r\n/);
+      ok(rows.length === api.total && m && Number(m[1]) === csvTotal && csvTotal === api.summary.ads.total, `CSV impression rows/summary match the filtered table (${rows.length} rows, ${csvTotal} impressions)`);
+    }
 
     console.log("Sign out, direct access, old password, new password");
     await ev("signOut()");

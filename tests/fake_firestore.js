@@ -8,7 +8,7 @@ class FakeDb {
   }
   collection(name) {
     const db = this;
-    const mkSnap = (id, rec) => ({ id, exists: !!rec, data: () => (rec ? structuredCloneKeepTs(rec.data) : undefined) });
+    const mkSnap = (id, rec) => ({ id, ref: { _path: `${name}/${id}` }, exists: !!rec, data: () => (rec ? structuredCloneKeepTs(rec.data) : undefined) });
     const ref = (id) => ({
       _path: `${name}/${id}`,
       id,

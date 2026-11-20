@@ -49,7 +49,9 @@ const Timestamp = admin.firestore.Timestamp;
       if ((i + d) % 3 === 0) continue;
       const dk = istDateKey(today - d * 86400000);
       const base = Date.parse(dk + "T03:30:00Z");
-      await db.collection("appUsageDaily").doc(`dev-${i}_${dk}`).set({ uid: `dev-${i}`, ...p, dateKey: dk, openCount: 1 + ((i * 7 + d * 3) % 9),
+      // every 4th user has no ad impressions at all (zero-impression rows must still be listed)
+      const ads = i % 4 === 3 ? { adBanner: 0, adInterstitial: 0, adRewarded: 0 } : { adBanner: (i + d) % 7, adInterstitial: (i + d) % 3 === 1 ? 1 : 0, adRewarded: (i * d) % 5 === 0 ? 1 : 0 };
+      await db.collection("appUsageDaily").doc(`dev-${i}_${dk}`).set({ uid: `dev-${i}`, ...p, ...ads, dateKey: dk, openCount: 1 + ((i * 7 + d * 3) % 9),
         firstOpenedAt: Timestamp.fromMillis(base), lastOpenedAt: Timestamp.fromMillis(base + 5 * 3600000), recentEventIds: [] });
       n++;
     }

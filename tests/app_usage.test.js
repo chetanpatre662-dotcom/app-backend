@@ -588,9 +588,11 @@ test("report: default is TODAY and summary cards are computed from records", asy
     const r = await s.call("GET", "/admin/report", { token: t });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.query, { from: "2026-11-20", to: "2026-11-20" });
+    // all original summary fields unchanged; `ads` is an additive field (0 here: no impressions seeded)
     assert.deepEqual(r.json.summary, {
       totalOpens: 7 + 2 + 4 + 6, uniqueUsers: 4, avgOpensPerUser: 4.75,
       collegeUsers: 3, schoolUsers: 1, studentUsers: 2, facultyUsers: 1, parentUsers: 1,
+      ads: { total: 0, banner: 0, interstitial: 0, rewarded: 0, usersWithImpressions: 0 },
     });
     assert.equal(r.json.rows[0].userName, "RAHUL SHARMA"); // highest opens first
     assert.equal(r.json.rows[0].date, "2026-11-20");
@@ -743,9 +745,10 @@ test("export: CSV with BOM, aggregated totals, honours filters, protected", asyn
     assert.match(r.headers.get("content-disposition"), /app-usage_2026-11-01_2026-11-30\.csv/);
     assert.ok(r.text.startsWith("\uFEFF"));
     const lines = r.text.replace("\uFEFF", "").split("\r\n\r\n")[0].trim().split("\r\n"); // user table part
-    assert.equal(lines[0], "S.No,User Name,Mobile,Institution,User Type,Course,Academic Year,App Open Count,First Opened (IST),Last Opened (IST),Date");
+    // original columns unchanged and in the same order; the 4 impression columns follow App Open Count
+    assert.equal(lines[0], "S.No,User Name,Mobile,Institution,User Type,Course,Academic Year,App Open Count,Banner Impressions,Interstitial Impressions,Rewarded Impressions,Total Ad Impressions,First Opened (IST),Last Opened (IST),Date");
     assert.equal(lines.length, 3);
-    assert.match(lines[1], /^1,RAHUL SHARMA,9876543210,college,student,BTech,2nd Year,15,/);
+    assert.match(lines[1], /^1,RAHUL SHARMA,9876543210,college,student,BTech,2nd Year,15,0,0,0,0,/);
     assert.match(lines[1], /2026-11-18 to 2026-11-20$/);
   } finally {
     s.close();
@@ -989,6 +992,226 @@ test("cards: CSV export appends active / registered summary after the unchanged 
       "Total App Opens,23,",
       "Avg Opens / Registered User,3.83,",
     ]);
+  } finally {
+    s.close();
+  }
+});
+
+// ───────────────────────── ad impressions ─────────────────────────
+let adSeq = 0;
+const adEv = (format, extra = {}) => ({ eventId: `ad_${String(++adSeq).padStart(8, "0")}_xyzxyzxy`, format, ...extra });
+const sendAds = (s, uid, events, token) => s.call("POST", "/ads", { token: token || `good-${uid}`, body: { events } });
+
+test("ads: auth required, invalid token rejected, foreign uid rejected, nothing written", async () => {
+  const s = await setup();
+  try {
+    assert.equal((await s.call("POST", "/ads", { body: { events: [adEv("banner")] } })).status, 401);
+    assert.equal((await sendAds(s, "u-stud", [adEv("banner")], "garbage")).status, 401);
+    const r = await s.call("POST", "/ads", { token: "good-u-stud", body: { uid: "u-fac", events: [adEv("banner")] } });
+    assert.equal(r.status, 403);
+    assert.equal([...s.db.docs.keys()].filter((k) => k.startsWith("appUsageDaily/")).length, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads: validation (format, eventId, batch size, extra fields, client totals ignored)", async () => {
+  const s = await setup();
+  try {
+    assert.equal((await sendAds(s, "u-stud", [])).status, 400);
+    assert.equal((await sendAds(s, "u-stud", [adEv("native")])).status, 400);
+    assert.equal((await sendAds(s, "u-stud", [adEv("appOpen")])).status, 400);
+    assert.equal((await sendAds(s, "u-stud", [{ eventId: "short", format: "banner" }])).status, 400);
+    assert.equal((await sendAds(s, "u-stud", Array.from({ length: 51 }, () => adEv("banner")))).status, 400);
+    assert.equal((await sendAds(s, "u-stud", [adEv("banner", { count: 999 })])).status, 400, "extra fields such as client totals are refused");
+    assert.equal((await s.call("POST", "/ads", { token: "good-u-stud", body: { events: [adEv("banner")], totals: { banner: 50 } } })).status, 400);
+    assert.equal((await sendAds(s, "u-stud", [adEv("banner", { occurredAt: "x" })])).status, 400);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads: each format counted exactly once into the user's daily doc; app opens untouched", async () => {
+  const s = await setup();
+  try {
+    await s.open("u-stud");
+    await s.open("u-stud");
+    const r = await sendAds(s, "u-stud", [adEv("banner"), adEv("banner"), adEv("interstitial"), adEv("rewarded")]);
+    assert.equal(r.status, 200);
+    assert.deepEqual([r.json.counted, r.json.duplicates], [4, 0]);
+    const d = dailyDoc(s.db, "u-stud", "2026-11-20");
+    assert.deepEqual([d.openCount, d.adBanner, d.adInterstitial, d.adRewarded], [2, 2, 1, 1]);
+    assert.equal(d.userType, "student");
+    assert.ok(!("adNetwork" in d) && !("revenue" in d), "no network / revenue data stored");
+    // a later open still increments the same doc normally
+    await s.open("u-stud");
+    assert.equal(dailyDoc(s.db, "u-stud", "2026-11-20").openCount, 3);
+    assert.equal(dailyDoc(s.db, "u-stud", "2026-11-20").adBanner, 2);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads: retries and duplicate callbacks never double count (same eventId, same batch or later batch)", async () => {
+  const s = await setup();
+  try {
+    const a = adEv("banner"), b = adEv("rewarded");
+    const r1 = await sendAds(s, "u-stud", [a, a, b]); // duplicate inside the batch
+    assert.deepEqual([r1.json.counted, r1.json.duplicates], [2, 1]);
+    const r2 = await sendAds(s, "u-stud", [a, b]); // full retry of the batch
+    assert.deepEqual([r2.json.counted, r2.json.duplicates], [0, 2]);
+    const r3 = await sendAds(s, "u-stud", [a, adEv("interstitial")]); // partial retry + new
+    assert.deepEqual([r3.json.counted, r3.json.duplicates], [1, 1]);
+    const d = dailyDoc(s.db, "u-stud", "2026-11-20");
+    assert.deepEqual([d.adBanner, d.adInterstitial, d.adRewarded], [1, 1, 1]);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads: concurrent batches are all counted (transactions), still no duplicates", async () => {
+  const s = await setup();
+  try {
+    await s.open("u-fac");
+    const batches = Array.from({ length: 8 }, () => [adEv("banner"), adEv("banner"), adEv("interstitial")]);
+    const rs = await Promise.all(batches.map((b) => sendAds(s, "u-fac", b)));
+    assert.ok(rs.every((r) => r.status === 200));
+    await Promise.all(batches.map((b) => sendAds(s, "u-fac", b))); // concurrent retries
+    const d = dailyDoc(s.db, "u-fac", "2026-11-20");
+    assert.deepEqual([d.adBanner, d.adInterstitial], [16, 8]);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads: offline batch spanning midnight goes to each IST day; impressions without an open create a 0-open doc", async () => {
+  const s = await setup();
+  try {
+    s.clock.t = Date.UTC(2026, 10, 20, 18, 40); // 00:10 IST on the 21st
+    const r = await sendAds(s, "u-par", [
+      adEv("banner", { occurredAt: Date.UTC(2026, 10, 20, 18, 20) }), // 23:50 IST on the 20th
+      adEv("banner", { occurredAt: Date.UTC(2026, 10, 20, 18, 35) }), // 00:05 IST on the 21st
+      adEv("rewarded", { occurredAt: Date.UTC(2026, 10, 17, 0, 0) }), // > 48h old -> server time (21st)
+    ]);
+    assert.equal(r.json.counted, 3);
+    const d20 = dailyDoc(s.db, "u-par", "2026-11-20"), d21 = dailyDoc(s.db, "u-par", "2026-11-21");
+    assert.deepEqual([d20.openCount, d20.adBanner], [0, 1]);
+    assert.deepEqual([d21.openCount, d21.adBanner, d21.adRewarded], [0, 1, 1]);
+    assert.equal(d21.userType, "parent"); // trusted profile, not client data
+    // a later app open on the 21st sets first/last opened normally
+    await s.open("u-par");
+    const after = dailyDoc(s.db, "u-par", "2026-11-21");
+    assert.equal(after.openCount, 1);
+    assert.ok(after.firstOpenedAt && after.lastOpenedAt);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads: unknown account (no profile) -> 404; rate limit per user", async () => {
+  const s = await setup();
+  try {
+    assert.equal((await sendAds(s, "u-nobody", [adEv("banner")])).status, 404);
+    let last;
+    for (let i = 0; i < 42; i++) last = await sendAds(s, "u-stud", [adEv("banner")]);
+    assert.equal(last.status, 429);
+    assert.equal((await sendAds(s, "u-fac", [adEv("banner")])).status, 200, "other users unaffected");
+  } finally {
+    s.close();
+  }
+});
+
+test("ads report: per-user totals, users never mix, zero-impression users listed, filters apply, summary = table", async () => {
+  const s = await setup();
+  try {
+    await seedUsage(s); // opens for 5 users across Nov 18-20 (+ Oct 31 parent)
+    await sendAds(s, "u-stud", [adEv("banner"), adEv("banner"), adEv("banner"), adEv("interstitial")]);
+    await sendAds(s, "u-fac", [adEv("rewarded"), adEv("banner")]);
+    s.clock.t = T0 - 86400000; // Nov 19
+    await sendAds(s, "u-stud", [adEv("rewarded")]);
+    s.clock.t = T0;
+    s.router._internals.rangeCache.clear();
+    const t = await authed(s);
+    const get = async (o) => (await s.call("GET", "/admin/report" + q(o), { token: t })).json;
+    const today = await get({});
+    const row = (j, uid) => j.rows.find((r) => r.uid === uid);
+    assert.deepEqual([row(today, "u-stud").adBanner, row(today, "u-stud").adInterstitial, row(today, "u-stud").adRewarded, row(today, "u-stud").adTotal], [3, 1, 0, 4]);
+    assert.deepEqual([row(today, "u-fac").adBanner, row(today, "u-fac").adRewarded, row(today, "u-fac").adTotal], [1, 1, 2]);
+    assert.equal(row(today, "u-par").adTotal, 0, "zero-impression user still listed");
+    assert.equal(row(today, "u-stud").openCount, 7, "app opens unchanged");
+    assert.deepEqual(today.summary.ads, { total: 6, banner: 4, interstitial: 1, rewarded: 1, usersWithImpressions: 2 });
+    const sum = today.rows.reduce((a, r) => a + r.adTotal, 0);
+    assert.equal(sum, today.summary.ads.total, "summary equals table");
+    // range aggregates both days for u-stud
+    const nov = await get({ from: "2026-11-01", to: "2026-11-30" });
+    assert.deepEqual([row(nov, "u-stud").adTotal, row(nov, "u-stud").adRewarded, row(nov, "u-stud").openCount], [5, 1, 15]);
+    // filters apply to impressions
+    assert.equal((await get({ userType: "faculty" })).summary.ads.total, 2);
+    assert.equal((await get({ institution: "school" })).summary.ads.total, 0);
+    assert.equal((await get({ from: "2026-11-01", to: "2026-11-30", weekday: "thursday" })).summary.ads.total, 1); // Nov 19
+    assert.equal((await get({ course: "btech" })).summary.ads.total, 4);
+    // search narrows table AND ad summary consistently
+    const srch = await get({ search: "mehta" });
+    assert.deepEqual([srch.rows.length, srch.summary.ads.total], [1, 2]);
+    // registered/active cards unaffected by ad-only activity
+    assert.equal(today.cards.active.users, 4);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads report: a user with only ad impressions (no open) appears with 0 opens and is not an active user", async () => {
+  const s = await setup();
+  try {
+    await sendAds(s, "u-sfac", [adEv("banner")]);
+    const t = await authed(s);
+    const j = (await s.call("GET", "/admin/report", { token: t })).json;
+    const r = j.rows.find((x) => x.uid === "u-sfac");
+    assert.deepEqual([r.openCount, r.adTotal, r.activeDays, r.firstOpenedAt], [0, 1, 0, null]);
+    assert.equal(j.cards.active.users, 0);
+    assert.equal(j.summary.totalOpens, 0);
+  } finally {
+    s.close();
+  }
+});
+
+test("ads CSV: impression columns per user + summary equal to the table rows", async () => {
+  const s = await setup();
+  try {
+    await seedUsage(s);
+    await sendAds(s, "u-stud", [adEv("banner"), adEv("interstitial"), adEv("rewarded"), adEv("rewarded")]);
+    s.router._internals.rangeCache.clear();
+    const t = await authed(s);
+    const r = await s.call("GET", "/admin/export" + q({ from: "2026-11-20", to: "2026-11-20" }), { token: t });
+    const [table, , ads] = r.text.replace("\uFEFF", "").split("\r\n\r\n");
+    const lines = table.trim().split("\r\n");
+    assert.equal(lines[0], "S.No,User Name,Mobile,Institution,User Type,Course,Academic Year,App Open Count,Banner Impressions,Interstitial Impressions,Rewarded Impressions,Total Ad Impressions,First Opened (IST),Last Opened (IST),Date");
+    assert.match(lines[1], /^1,RAHUL SHARMA,9876543210,college,student,BTech,2nd Year,7,1,1,2,4,/);
+    assert.ok(lines.slice(2).every((l) => /,0,0,0,0,/.test(l)), "other users 0 impressions");
+    assert.deepEqual(ads.trim().split("\r\n"), [
+      "Ad Impressions,Count",
+      "Total Ad Impressions,4",
+      "Banner Impressions,1",
+      "Interstitial Impressions,1",
+      "Rewarded Impressions,2",
+      "Users with Ad Impressions,1",
+    ]);
+  } finally {
+    s.close();
+  }
+});
+
+test("account deletion helper removes all of a user's app usage docs (opens + impressions) only", async () => {
+  const s = await setup();
+  try {
+    await seedUsage(s);
+    await sendAds(s, "u-stud", [adEv("banner")]);
+    s.db.batch = () => { const ops = []; return { delete: (ref) => ops.push(ref), commit: async () => { for (const r of ops) s.db.docs.delete(r._path); } }; };
+    const n = await mod.deleteUserUsageRecords(s.db, "u-stud"); // seedUsage: Nov 18/19/20 (ads land in the Nov 20 doc)
+    assert.equal(n, 3);
+    assert.equal([...s.db.docs.keys()].filter((k) => k.startsWith("appUsageDaily/u-stud_")).length, 0);
+    assert.ok([...s.db.docs.keys()].some((k) => k.startsWith("appUsageDaily/u-fac_")), "other users untouched");
+    assert.equal(await mod.deleteUserUsageRecords(s.db, ""), 0);
   } finally {
     s.close();
   }

@@ -6121,6 +6121,14 @@ async function cleanupUser(collectionName, docId) {
       }
     } catch (_) { log("Attendance cleanup skipped"); }
 
+    // 5b. Delete App Usage Analytics records (app opens + ad impressions) for this account
+    if (uid) {
+      try {
+        const n = await require("./src/appUsage").deleteUserUsageRecords(admin.firestore(), uid);
+        if (n) log(`Deleted ${n} app usage records`);
+      } catch (_) { log("App usage cleanup skipped"); }
+    }
+
     // 6. Delete the user document itself (LAST)
     await userDocRef.delete();
     results.doc = true;

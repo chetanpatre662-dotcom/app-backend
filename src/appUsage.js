@@ -29,6 +29,11 @@ const ADMIN_DOC = "credentials";
 const IST_OFFSET_MS = 330 * 60 * 1000; // Asia/Kolkata, no DST
 const MAX_DAILY_OPENS = 500; // per user per day; anything above is ignored (abuse guard)
 const MAX_RECENT_EVENT_IDS = 50; // idempotency keys kept inside the daily doc
+const AD_FORMATS = ["banner", "interstitial", "rewarded"];
+const AD_EVENT_KEYS = ["eventId", "format", "occurredAt"];
+const MAX_AD_BATCH = 50; // impressions per request
+const MAX_AD_EVENT_IDS = 400; // ad idempotency keys kept per daily doc (~10 KB)
+const MAX_DAILY_AD_IMPRESSIONS = 2000; // per user per day; above this is ignored (abuse guard)
 const MAX_EVENT_AGE_MS = 48 * 3600 * 1000; // offline retries older than this use server time
 const MAX_EVENT_FUTURE_MS = 5 * 60 * 1000;
 const PROFILE_TTL_MS = 12 * 3600 * 1000;
@@ -220,6 +225,9 @@ function aggregateByUser(rows) {
         course: r.course,
         year: r.year,
         openCount: 0,
+        adBanner: 0,
+        adInterstitial: 0,
+        adRewarded: 0,
         firstOpenedAt: r.firstOpenedAt,
         lastOpenedAt: r.lastOpenedAt,
         minDate: r.dateKey,
@@ -230,7 +238,10 @@ function aggregateByUser(rows) {
       map.set(r.uid, a);
     }
     a.openCount += r.openCount;
-    a.activeDays += 1;
+    a.adBanner += r.adBanner || 0;
+    a.adInterstitial += r.adInterstitial || 0;
+    a.adRewarded += r.adRewarded || 0;
+    if (r.openCount > 0) a.activeDays += 1; // a day with only ad impressions is not an "active day"
     if (r.firstOpenedAt && (!a.firstOpenedAt || r.firstOpenedAt < a.firstOpenedAt)) a.firstOpenedAt = r.firstOpenedAt;
     if (r.lastOpenedAt && (!a.lastOpenedAt || r.lastOpenedAt > a.lastOpenedAt)) a.lastOpenedAt = r.lastOpenedAt;
     if (r.dateKey < a.minDate) a.minDate = r.dateKey;
@@ -260,7 +271,14 @@ function summarize(users) {
     facultyUsers: 0,
     parentUsers: 0,
   };
+  s.ads = { total: 0, banner: 0, interstitial: 0, rewarded: 0, usersWithImpressions: 0 };
   for (const u of users) {
+    const adTotal = (u.adBanner || 0) + (u.adInterstitial || 0) + (u.adRewarded || 0);
+    s.ads.banner += u.adBanner || 0;
+    s.ads.interstitial += u.adInterstitial || 0;
+    s.ads.rewarded += u.adRewarded || 0;
+    s.ads.total += adTotal;
+    if (adTotal > 0) s.ads.usersWithImpressions++;
     s.totalOpens += u.openCount;
     if (u.institution === "college") s.collegeUsers++;
     else if (u.institution === "school") s.schoolUsers++;
@@ -343,6 +361,10 @@ function publicRow(u, index) {
     year: u.year,
     yearLabel: yearLabel(u.year),
     openCount: u.openCount,
+    adBanner: u.adBanner || 0,
+    adInterstitial: u.adInterstitial || 0,
+    adRewarded: u.adRewarded || 0,
+    adTotal: (u.adBanner || 0) + (u.adInterstitial || 0) + (u.adRewarded || 0),
     firstOpenedAt: u.firstOpenedAt ? new Date(u.firstOpenedAt).toISOString() : null,
     lastOpenedAt: u.lastOpenedAt ? new Date(u.lastOpenedAt).toISOString() : null,
     date: u.minDate === u.maxDate ? u.minDate : `${u.minDate} to ${u.maxDate}`,
@@ -363,7 +385,7 @@ function formatIst(iso) {
   return `${d.toISOString().slice(0, 10)} ${d.toISOString().slice(11, 19)}`;
 }
 
-function toCsv(rows, cards, totalOpens) {
+function toCsv(rows, cards, totalOpens, ads) {
   const head = [
     "S.No",
     "User Name",
@@ -373,6 +395,10 @@ function toCsv(rows, cards, totalOpens) {
     "Course",
     "Academic Year",
     "App Open Count",
+    "Banner Impressions",
+    "Interstitial Impressions",
+    "Rewarded Impressions",
+    "Total Ad Impressions",
     "First Opened (IST)",
     "Last Opened (IST)",
     "Date",
@@ -389,6 +415,10 @@ function toCsv(rows, cards, totalOpens) {
         r.courseLabel,
         r.yearLabel,
         r.openCount,
+        r.adBanner,
+        r.adInterstitial,
+        r.adRewarded,
+        r.adTotal,
         formatIst(r.firstOpenedAt),
         formatIst(r.lastOpenedAt),
         r.date,
@@ -405,6 +435,12 @@ function toCsv(rows, cards, totalOpens) {
     }
     lines.push(["Total App Opens", totalOpens, ""].map(csvCell).join(","));
     lines.push(["Avg Opens / Registered User", cards.avgOpensPerRegisteredUser.toFixed(2), ""].map(csvCell).join(","));
+  }
+  if (ads) {
+    lines.push("", ["Ad Impressions", "Count"].map(csvCell).join(","));
+    for (const [label, v] of [["Total Ad Impressions", ads.total], ["Banner Impressions", ads.banner], ["Interstitial Impressions", ads.interstitial], ["Rewarded Impressions", ads.rewarded], ["Users with Ad Impressions", ads.usersWithImpressions]]) {
+      lines.push([label, v].map(csvCell).join(","));
+    }
   }
   return "\uFEFF" + lines.join("\r\n") + "\r\n";
 }
@@ -425,6 +461,7 @@ function createAppUsageRouter(deps) {
   const log = deps.log || ((...a) => console.log("[app-usage]", ...a));
 
   const openLimiter = createSlidingLimiter(30, 10 * 60 * 1000); // per uid
+  const adLimiter = createSlidingLimiter(40, 10 * 60 * 1000); // ad batches per uid
   const badTokenLimiter = createSlidingLimiter(40, 15 * 60 * 1000); // per IP (failed token checks)
   const loginIpLimiter = createSlidingLimiter(10, 15 * 60 * 1000); // failed logins per IP
   const loginUserLimiter = createSlidingLimiter(5, 15 * 60 * 1000); // failed logins per username
@@ -588,6 +625,152 @@ function createAppUsageRouter(deps) {
     } catch (e) {
       log("open error:", e && e.message);
       return res.status(500).json({ success: false, error: "Could not record app open" });
+    }
+  });
+
+  // ───────────────────────── POST /ads (ad impressions) ───────────────────
+  // Body: { events: [{ eventId, format: "banner"|"interstitial"|"rewarded", occurredAt? }] } (1..50 events)
+  // Each event = one impression reported by the ad SDK's onAdImpression callback on the device.
+  // Counts are added to the SAME appUsageDaily/{uid}_{IST date} document as the app opens (fields
+  // adBanner / adInterstitial / adRewarded), so the dashboard needs no extra reads. Identity comes only
+  // from the Firebase ID token; client totals are never accepted, the server counts events itself.
+  // Retries are de-duplicated by eventId (last MAX_AD_EVENT_IDS ids kept per daily doc).
+  router.post("/ads", async (req, res) => {
+    const ip = clientIp(req);
+    try {
+      const authHeader = String(req.headers.authorization || "");
+      if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ success: false, error: "Authentication required" });
+      }
+      const blocked = badTokenLimiter.peek(ip);
+      if (blocked) {
+        res.set("Retry-After", String(blocked));
+        return res.status(429).json({ success: false, error: "Too many invalid requests" });
+      }
+      const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : null;
+      const events = body && Array.isArray(body.events) ? body.events : null;
+      if (!events || events.length < 1 || events.length > MAX_AD_BATCH || Object.keys(body).some((k) => k !== "events" && k !== "uid")) {
+        return res.status(400).json({ success: false, error: `events must be an array of 1-${MAX_AD_BATCH} items` });
+      }
+      const t0 = now();
+      const parsed = [];
+      const seenInBatch = new Set();
+      for (const ev of events) {
+        if (!ev || typeof ev !== "object" || Array.isArray(ev) || Object.keys(ev).some((k) => !AD_EVENT_KEYS.includes(k))) {
+          return res.status(400).json({ success: false, error: "Invalid event" }); // e.g. client-supplied counts are refused
+        }
+        if (typeof ev.eventId !== "string" || !EVENT_ID_RE.test(ev.eventId)) {
+          return res.status(400).json({ success: false, error: "eventId must be 16-64 chars [A-Za-z0-9_-]" });
+        }
+        if (!AD_FORMATS.includes(ev.format)) return res.status(400).json({ success: false, error: "Invalid format" });
+        let at = t0;
+        if (ev.occurredAt !== undefined && ev.occurredAt !== null) {
+          if (!Number.isFinite(ev.occurredAt) || ev.occurredAt <= 0) return res.status(400).json({ success: false, error: "Invalid occurredAt" });
+          const t = Math.floor(ev.occurredAt);
+          if (t <= t0 + MAX_EVENT_FUTURE_MS && t0 - t <= MAX_EVENT_AGE_MS) at = Math.min(t, t0);
+        }
+        if (seenInBatch.has(ev.eventId)) continue; // duplicate inside the same batch
+        seenInBatch.add(ev.eventId);
+        parsed.push({ id: ev.eventId, format: ev.format, at });
+      }
+
+      let uid;
+      try {
+        const decoded = await verifyIdToken(authHeader.slice(7));
+        uid = decoded && decoded.uid;
+        if (!uid) throw new Error("no uid");
+      } catch (_) {
+        badTokenLimiter.hit(ip);
+        return res.status(401).json({ success: false, error: "Invalid or expired authentication token" });
+      }
+      if (body.uid !== undefined && body.uid !== uid) {
+        badTokenLimiter.hit(ip);
+        return res.status(403).json({ success: false, error: "uid does not match authenticated user" });
+      }
+      const wait = adLimiter.hit(uid);
+      if (wait) {
+        res.set("Retry-After", String(wait));
+        return res.status(429).json({ success: false, error: "Too many ad events" });
+      }
+
+      // group by IST day -> one transaction per day (normally exactly one)
+      const byDay = new Map();
+      for (const p of parsed) {
+        const dk = istDateKey(p.at);
+        if (!byDay.has(dk)) byDay.set(dk, []);
+        byDay.get(dk).push(p);
+      }
+      let counted = 0, duplicates = 0, capped = 0;
+      for (const [dateKey, list] of byDay) {
+        const ref = db.collection(COLLECTION).doc(`${uid}_${dateKey}`);
+        const attempt = (profile) =>
+          db.runTransaction(async (tx) => {
+            const snap = await tx.get(ref);
+            const d = snap.exists ? snap.data() : null;
+            if (!d && !profile) return { needProfile: true };
+            const ids = d && Array.isArray(d.adEventIds) ? d.adEventIds : [];
+            const known = new Set(ids);
+            const inc = { banner: 0, interstitial: 0, rewarded: 0 };
+            let dayTotal = d ? (d.adBanner || 0) + (d.adInterstitial || 0) + (d.adRewarded || 0) : 0;
+            const newIds = [];
+            let dup = 0, cap = 0;
+            for (const p of list) {
+              if (known.has(p.id)) { dup++; continue; }
+              if (dayTotal >= MAX_DAILY_AD_IMPRESSIONS) { cap++; continue; }
+              known.add(p.id);
+              newIds.push(p.id);
+              inc[p.format]++;
+              dayTotal++;
+            }
+            const n = newIds.length;
+            if (!n) return { counted: 0, dup, cap };
+            const adEventIds = [...ids, ...newIds].slice(-MAX_AD_EVENT_IDS);
+            if (d) {
+              tx.update(ref, {
+                adBanner: (d.adBanner || 0) + inc.banner,
+                adInterstitial: (d.adInterstitial || 0) + inc.interstitial,
+                adRewarded: (d.adRewarded || 0) + inc.rewarded,
+                adEventIds,
+              });
+            } else {
+              // impressions without an app open that day (e.g. past midnight): openCount stays 0
+              tx.set(ref, {
+                uid,
+                userName: profile.userName,
+                mobile: profile.mobile,
+                institution: profile.institution,
+                userType: profile.userType,
+                course: profile.course,
+                year: profile.year,
+                dateKey,
+                openCount: 0,
+                firstOpenedAt: null,
+                lastOpenedAt: null,
+                recentEventIds: [],
+                adBanner: inc.banner,
+                adInterstitial: inc.interstitial,
+                adRewarded: inc.rewarded,
+                adEventIds,
+              });
+            }
+            return { counted: n, dup, cap };
+          });
+        const cached = profileCache.get(uid);
+        let r = await attempt(cached && now() - cached.at < PROFILE_TTL_MS ? cached.profile : null);
+        if (r.needProfile) {
+          const profile = await resolveProfile(uid, "");
+          if (!profile) return res.status(404).json({ success: false, error: "No user profile found for this account" });
+          r = await attempt(profile);
+          if (r.needProfile) return res.status(503).json({ success: false, error: "Please retry" });
+        }
+        counted += r.counted;
+        duplicates += r.dup;
+        capped += r.cap;
+      }
+      return res.json({ success: true, received: events.length, counted, duplicates: duplicates + (events.length - parsed.length), capped });
+    } catch (e) {
+      log("ads error:", e && e.message);
+      return res.status(500).json({ success: false, error: "Could not record ad impressions" });
     }
   });
 
@@ -868,6 +1051,9 @@ function createAppUsageRouter(deps) {
       year: d.year === undefined || d.year === null ? "" : String(d.year),
       dateKey: d.dateKey,
       openCount: Number(d.openCount) || 0,
+      adBanner: Number(d.adBanner) || 0,
+      adInterstitial: Number(d.adInterstitial) || 0,
+      adRewarded: Number(d.adRewarded) || 0,
       firstOpenedAt: d.firstOpenedAt && d.firstOpenedAt.toMillis ? d.firstOpenedAt.toMillis() : 0,
       lastOpenedAt: d.lastOpenedAt && d.lastOpenedAt.toMillis ? d.lastOpenedAt.toMillis() : 0,
     };
@@ -883,7 +1069,7 @@ function createAppUsageRouter(deps) {
         .collection(COLLECTION)
         .where("dateKey", ">=", from)
         .where("dateKey", "<=", to)
-        .select("uid", "userName", "mobile", "institution", "userType", "course", "year", "dateKey", "openCount", "firstOpenedAt", "lastOpenedAt")
+        .select("uid", "userName", "mobile", "institution", "userType", "course", "year", "dateKey", "openCount", "firstOpenedAt", "lastOpenedAt", "adBanner", "adInterstitial", "adRewarded")
         .get();
       const rows = snap.docs.map(fromDoc);
       // Ranges that include today change as users open the app: short TTL. Past ranges: longer.
@@ -954,6 +1140,8 @@ function createAppUsageRouter(deps) {
     cards.duplicateProfiles = pop.duplicates;
     cards.registeredAsOf = new Date(pop.at).toISOString();
     const matched = sortUsers(searchUsers(users, f.search), f.sort);
+    // Ad summary = totals of exactly the table rows (all pages, search applied).
+    summary.ads = summarize(matched).ads;
     return { cached, courses, years, summary, cards, matched };
   }
 
@@ -1012,7 +1200,9 @@ function createAppUsageRouter(deps) {
       res.set("Cache-Control", "no-store");
       res.set("Content-Type", "text/csv; charset=utf-8");
       res.set("Content-Disposition", `attachment; filename="app-usage_${f.from}_${f.to}.csv"`);
-      return res.send(toCsv(rows, r.cards, r.summary.totalOpens));
+      // Ad totals of exactly the exported rows (search applied), so the CSV summary equals the CSV table.
+      const ads = rows.reduce((a, x) => ({ total: a.total + x.adTotal, banner: a.banner + x.adBanner, interstitial: a.interstitial + x.adInterstitial, rewarded: a.rewarded + x.adRewarded, usersWithImpressions: a.usersWithImpressions + (x.adTotal > 0 ? 1 : 0) }), { total: 0, banner: 0, interstitial: 0, rewarded: 0, usersWithImpressions: 0 });
+      return res.send(toCsv(rows, r.cards, r.summary.totalOpens, ads));
     } catch (e) {
       log("export error:", e && e.message);
       return res.status(500).json({ success: false, error: "Could not export analytics" });
@@ -1024,8 +1214,27 @@ function createAppUsageRouter(deps) {
   return router;
 }
 
+/**
+ * Account deletion: removes every appUsageDaily document (app opens + ad impressions) of one user.
+ * Called from cleanupUser() in index.js. Deletes in chunks of 400 (Firestore batch limit 500).
+ */
+async function deleteUserUsageRecords(db, uid) {
+  if (typeof uid !== "string" || !uid.trim()) return 0;
+  let deleted = 0;
+  for (;;) {
+    const snap = await db.collection(COLLECTION).where("uid", "==", uid).limit(400).get();
+    if (snap.empty) return deleted;
+    const batch = db.batch();
+    snap.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+    deleted += snap.docs.length;
+    if (snap.docs.length < 400) return deleted;
+  }
+}
+
 module.exports = {
   createAppUsageRouter,
+  deleteUserUsageRecords,
   // exported for tests
   istDateKey,
   isValidDateKey,
