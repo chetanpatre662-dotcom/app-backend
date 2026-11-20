@@ -54,7 +54,19 @@ const Timestamp = admin.firestore.Timestamp;
       n++;
     }
   }
-  console.log("seeded", n, "daily docs; credential record absent (fresh bootstrap)");
+  // registered profiles for the dev users above + 40 registered users who never opened the app
+  const profileOf = (i) => {
+    const type = i % 7 === 0 ? "faculty" : i % 5 === 0 ? "parent" : "student";
+    const inst = type === "parent" ? "school" : i % 11 === 0 ? "school" : "college";
+    const [course, years] = COURSES[i % 3];
+    const col = type === "student" ? "students" : type === "faculty" ? "faculty" : "parents";
+    const doc = { uid: `dev-${i}`, name: `Dev ${i}`, institution: inst, role: type };
+    if (type === "student") Object.assign(doc, { course, year: years[i % years.length] });
+    if (type === "faculty") doc.facultyType = inst === "school" ? "School" : "College";
+    return [col, doc];
+  };
+  for (let i = 0; i < 100; i++) { const [col, doc] = profileOf(i); await db.collection(col).doc(`${col}-${i}`).set(doc); }
+  console.log("seeded", n, "daily docs, 100 registered profiles (60 active); credential record absent (fresh bootstrap)");
 
   // ── backend (what production Express sees: no /api prefix) ──
   const app = express();

@@ -272,6 +272,39 @@ function summarize(users) {
   return s;
 }
 
+/**
+ * Card figures: "active / registered" per category.
+ *   population   registered users [{uid, institution, userType, course, year}] (current profiles)
+ *   activeUids   Set of uids with at least one app open in the selected dates (+ weekday)
+ *   totalOpens   the "Total App Opens" card value (unchanged metric)
+ * Registered totals ignore date/weekday/search (a registered user stays registered) but respect
+ * institution, user type, course and year. Active users are taken from that same registered set, so
+ * active <= registered always holds and each person is counted once per category.
+ */
+function computeCards(population, activeUids, f, totalOpens) {
+  const keys = ["users", "college", "school", "student", "faculty", "parent"];
+  const registered = Object.fromEntries(keys.map((k) => [k, 0]));
+  const active = Object.fromEntries(keys.map((k) => [k, 0]));
+  let unclassified = 0;
+  for (const p of population) {
+    if (f.institution !== "all" && p.institution !== f.institution) continue;
+    if (f.userType !== "all" && p.userType !== f.userType) continue;
+    if (f.course !== "all" && p.course !== f.course) continue;
+    if (f.year !== "all" && String(p.year).toLowerCase() !== f.year) continue;
+    const isActive = activeUids.has(p.uid);
+    const bump = (k) => {
+      registered[k]++;
+      if (isActive) active[k]++;
+    };
+    bump("users");
+    if (p.institution === "college" || p.institution === "school") bump(p.institution);
+    else unclassified++;
+    if (p.userType === "student" || p.userType === "faculty" || p.userType === "parent") bump(p.userType);
+  }
+  const avgOpensPerRegisteredUser = registered.users ? Math.round((totalOpens / registered.users) * 100) / 100 : 0;
+  return { registered, active, avgOpensPerRegisteredUser, unclassifiedInstitution: unclassified };
+}
+
 function searchUsers(users, term) {
   if (!term) return users;
   const digits = term.replace(/\D/g, "");
@@ -330,7 +363,7 @@ function formatIst(iso) {
   return `${d.toISOString().slice(0, 10)} ${d.toISOString().slice(11, 19)}`;
 }
 
-function toCsv(rows) {
+function toCsv(rows, cards, totalOpens) {
   const head = [
     "S.No",
     "User Name",
@@ -363,6 +396,15 @@ function toCsv(rows) {
         .map(csvCell)
         .join(",")
     );
+  }
+  if (cards) {
+    const a = cards.active, g = cards.registered;
+    lines.push("", ["Summary", "Active Users", "Registered Users"].map(csvCell).join(","));
+    for (const [label, k] of [["App Users", "users"], ["College Users", "college"], ["School Users", "school"], ["Student Users", "student"], ["Faculty Users", "faculty"], ["Parent Users", "parent"]]) {
+      lines.push([label, a[k], g[k]].map(csvCell).join(","));
+    }
+    lines.push(["Total App Opens", totalOpens, ""].map(csvCell).join(","));
+    lines.push(["Avg Opens / Registered User", cards.avgOpensPerRegisteredUser.toFixed(2), ""].map(csvCell).join(","));
   }
   return "\uFEFF" + lines.join("\r\n") + "\r\n";
 }
@@ -858,18 +900,61 @@ function createAppUsageRouter(deps) {
     }
   }
 
+  // Registered population for the "x / total" cards: students, faculty, parents (the real profile
+  // collections). Field mask keeps documents small; one read per profile document per refresh,
+  // shared by all dashboard requests for POPULATION_TTL_MS. Profiles without a uid cannot sign in
+  // or be tracked and are not counted; the same uid in two collections is counted once.
+  const POPULATION_TTL_MS = 10 * 60 * 1000;
+  let populationCache = null; // {list, excludedNoUid, duplicates, at}
+  let populationInflight = null;
+  async function loadPopulation() {
+    if (populationCache && now() - populationCache.at < POPULATION_TTL_MS) return populationCache;
+    if (populationInflight) return populationInflight;
+    populationInflight = (async () => {
+      const seen = new Set();
+      const list = [];
+      let excludedNoUid = 0, duplicates = 0;
+      for (const col of ["students", "faculty", "parents"]) {
+        const snap = await db.collection(col).select("uid", "institution", "facultyType", "course", "year").get();
+        for (const d of snap.docs) {
+          const data = d.data();
+          const uid = typeof data.uid === "string" ? data.uid.trim() : "";
+          if (!uid) { excludedNoUid++; continue; }
+          if (seen.has(uid)) { duplicates++; continue; }
+          seen.add(uid);
+          const p = profileSnapshot(col, data);
+          list.push({ uid, institution: p.institution, userType: p.userType, course: p.course, year: p.year });
+        }
+      }
+      populationCache = { list, excludedNoUid, duplicates, at: now() };
+      return populationCache;
+    })();
+    try {
+      return await populationInflight;
+    } finally {
+      populationInflight = null;
+    }
+  }
+
   async function buildReport(f) {
-    const { rows, cached } = await loadRange(f.from, f.to);
-    // Dropdown options come from the whole range so selecting one course doesn't hide the others.
-    const courses = [...new Set(rows.map((r) => r.course).filter(Boolean))].sort();
-    const years = [...new Set(["1", "2", "3", "4", ...rows.map((r) => String(r.year)).filter(Boolean)])].sort(
+    const [{ rows, cached }, pop] = await Promise.all([loadRange(f.from, f.to), loadPopulation()]);
+    // Dropdown options: whole range + registered users, so selecting one course doesn't hide the others.
+    const courses = [...new Set([...rows.map((r) => r.course), ...pop.list.map((p) => p.course)].filter(Boolean))].sort();
+    const years = [...new Set(["1", "2", "3", "4", ...rows.map((r) => String(r.year)), ...pop.list.map((p) => String(p.year))].filter(Boolean))].sort(
       (a, b) => Number(a) - Number(b) || a.localeCompare(b)
     );
     const filtered = applyFilters(rows, f);
     const users = aggregateByUser(filtered);
     const summary = summarize(users);
+    // Active = opened the app in the selected dates (+ weekday); classified by the CURRENT profile.
+    const wd = f.weekday === "all" ? -1 : WEEKDAYS.indexOf(f.weekday);
+    const activeUids = new Set(rows.filter((r) => r.openCount > 0 && (wd < 0 || weekdayOfDateKey(r.dateKey) === wd)).map((r) => r.uid));
+    const cards = computeCards(pop.list, activeUids, f, summary.totalOpens);
+    cards.excludedProfilesWithoutUid = pop.excludedNoUid;
+    cards.duplicateProfiles = pop.duplicates;
+    cards.registeredAsOf = new Date(pop.at).toISOString();
     const matched = sortUsers(searchUsers(users, f.search), f.sort);
-    return { cached, courses, years, summary, matched };
+    return { cached, courses, years, summary, cards, matched };
   }
 
   function reportGuard(req, res) {
@@ -902,6 +987,7 @@ function createAppUsageRouter(deps) {
         success: true,
         query: { from: f.from, to: f.to },
         summary: r.summary,
+        cards: r.cards,
         rows,
         total,
         page,
@@ -926,7 +1012,7 @@ function createAppUsageRouter(deps) {
       res.set("Cache-Control", "no-store");
       res.set("Content-Type", "text/csv; charset=utf-8");
       res.set("Content-Disposition", `attachment; filename="app-usage_${f.from}_${f.to}.csv"`);
-      return res.send(toCsv(rows));
+      return res.send(toCsv(rows, r.cards, r.summary.totalOpens));
     } catch (e) {
       log("export error:", e && e.message);
       return res.status(500).json({ success: false, error: "Could not export analytics" });
@@ -948,6 +1034,7 @@ module.exports = {
   applyFilters,
   aggregateByUser,
   summarize,
+  computeCards,
   sortUsers,
   searchUsers,
   profileSnapshot,

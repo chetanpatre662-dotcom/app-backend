@@ -101,9 +101,28 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     await shot("appcount_dashboard");
 
     console.log("Filters, month aggregation, pagination, CSV");
+    const card = (k) => ev(`(()=>{const v=document.querySelector('[data-card="${k}"]');return {text:v.textContent.replace(/\\s+/g,' ').trim(),sub:v.parentElement.querySelector('.au-card-sub').textContent,label:v.parentElement.querySelector('.stat-label').textContent}})()`);
+    const ratio = (t) => t.split("/").map((x) => Number(x.replace(/[^0-9]/g, "")));
+    {
+      const users = await card("users"), col = await card("college"), sch = await card("school"), avg = await card("avg");
+      console.log("   cards:", JSON.stringify([users.text, col.text, sch.text, (await card("student")).text, (await card("faculty")).text, (await card("parent")).text, avg.text]));
+      const [a, t] = ratio(users.text);
+      ok(users.label === "App Users" && /^\d[\d,]* \/ \d[\d,]*$/.test(users.text) && t === 100 && a > 0 && a <= t, "App Users shows Active / Registered (" + users.text + ")");
+      ok(users.sub === `${a} Active · ${t} Registered`, "supporting text: " + users.sub);
+      ok(ratio(col.text)[1] + ratio(sch.text)[1] === t, "college + school registered = all registered");
+      const s = ratio((await card("student")).text)[1] + ratio((await card("faculty")).text)[1] + ratio((await card("parent")).text)[1];
+      ok(s === t, "student + faculty + parent registered = all registered");
+      const opens = Number((await card("totalOpens")).text.replace(/,/g, ""));
+      ok(avg.text === (opens / t).toFixed(2), `Avg = total opens / registered (${opens} / ${t} = ${avg.text})`);
+      ok(await ev("[...document.querySelectorAll('#cards .stat-value')].every(e=>e.scrollWidth<=e.clientWidth+1)"), "no card value overflows (desktop)");
+    }
     await setVal("fInstitution", "school"); await sleep(500); await tableReady();
-    ok((await ev("[...document.querySelectorAll('#cards .stat-card')][3].querySelector('.stat-value').textContent")) === "0", "institution filter applied");
+    ok((await card("college")).text === "0 / 0", "institution=school: College card 0 / 0");
+    ok(ratio((await card("school")).text)[1] === ratio((await card("users")).text)[1], "institution=school: School registered = App Users registered");
     await setVal("fInstitution", "all");
+    await setVal("fPeriod", "date"); await setVal("fDate", "2020-01-01"); await sleep(600); await tableReady();
+    { const u = ratio((await card("users")).text); ok(u[0] === 0 && u[1] === 100, "date with no opens: 0 active, registered unchanged (" + u.join(" / ") + ")"); }
+    await setVal("fPeriod", "today"); await sleep(500); await tableReady();
     await setVal("fPeriod", "month"); await sleep(500); await tableReady();
     const tot = Number((await ev("document.querySelector('#cards .stat-value').textContent")).replace(/,/g, ""));
     const users = Number((await ev("document.getElementById('countBadge').textContent")).replace(/,/g, ""));
@@ -113,6 +132,7 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     ok((await ev("document.querySelector('#tbody tr td').textContent")) === "11", "pagination page 2 starts at 11");
     const csv = await ev("fetch(API_BASE+'/app-usage/admin/export'+queryString()).then(async r=>({s:r.status,t:await r.text()}))");
     ok(csv.s === 200 && csv.t.includes("App Open Count"), "CSV export works with the cookie session");
+    ok(/Summary,Active Users,Registered Users\r\nApp Users,\d+,100\r\n/.test(csv.t), "CSV contains active / registered summary");
 
     console.log("Sign out, direct access, old password, new password");
     await ev("signOut()");
@@ -131,7 +151,11 @@ const ok = (cond, msg) => { checks++; if (!cond) failures++; console.log(cond ? 
     await ev("load()");
     ok(await waitFor("location.pathname==='/admin/index.html'"), "expired session sends the user back to login");
     await send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
-    await nav(LOGIN); await shot("login_mobile");
+    await login("Appcount", NEW_PW); await waitFor("location.pathname==='/admin/app/app-usage.html'"); await tableReady();
+    ok(await ev("[...document.querySelectorAll('#cards .stat-value')].every(e=>e.scrollWidth<=e.clientWidth+1) && document.documentElement.scrollWidth<=window.innerWidth+4"), "no card overflow on a 390px phone");
+    await shot("cards_mobile");
+    await send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 1000, deviceScaleFactor: 1, mobile: false });
+    await sleep(400); await shot("cards_desktop");
     ok(errors.length === 0, "no uncaught JS exceptions " + JSON.stringify(errors));
     ws.close();
   } catch (e) { failures++; console.log("ERROR", e.message); }

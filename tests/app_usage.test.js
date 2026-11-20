@@ -742,7 +742,7 @@ test("export: CSV with BOM, aggregated totals, honours filters, protected", asyn
     assert.match(r.headers.get("content-type"), /text\/csv/);
     assert.match(r.headers.get("content-disposition"), /app-usage_2026-11-01_2026-11-30\.csv/);
     assert.ok(r.text.startsWith("\uFEFF"));
-    const lines = r.text.replace("\uFEFF", "").trim().split("\r\n");
+    const lines = r.text.replace("\uFEFF", "").split("\r\n\r\n")[0].trim().split("\r\n"); // user table part
     assert.equal(lines[0], "S.No,User Name,Mobile,Institution,User Type,Course,Academic Year,App Open Count,First Opened (IST),Last Opened (IST),Date");
     assert.equal(lines.length, 3);
     assert.match(lines[1], /^1,RAHUL SHARMA,9876543210,college,student,BTech,2nd Year,15,/);
@@ -863,5 +863,133 @@ test("cookie path override (APP_USAGE_COOKIE_PATH) and invalid override falls ba
     assert.match((await loginInitial(s2)).setCookie, /Path=\/api\/app-usage(;|$)/);
   } finally {
     s2.close();
+  }
+});
+
+// ───────────────────────── active / registered cards ─────────────────────────
+// Registered profiles from setup(): u-stud (college student btech 2), u-poly (college student poly 1),
+// u-fac (college faculty), u-sfac (school faculty), u-par (school parent). Added here:
+//   u-never  college student btech 2, registered but never opened the app
+//   (no uid) a student profile without uid -> not counted
+//   u-gone   has app opens but no profile any more (deleted account) -> never counted as active
+async function seedCardsScenario(s) {
+  await seedUsage(s);
+  await s.db.collection("students").doc("student-003").set({ uid: "u-never", name: "Never Opened", institution: "college", course: "btech", year: "2" });
+  await s.db.collection("students").doc("student-004").set({ uid: "", name: "Broken Registration", institution: "college", course: "btech", year: "1" });
+  await s.db.collection("appUsageDaily").doc("u-gone_2026-11-20").set({
+    uid: "u-gone", userName: "Deleted", mobile: "", institution: "college", userType: "student", course: "btech", year: "2",
+    dateKey: "2026-11-20", openCount: 4, firstOpenedAt: Timestamp.fromMillis(T0), lastOpenedAt: Timestamp.fromMillis(T0), recentEventIds: [],
+  });
+}
+
+test("cards: today = active/registered per category, never-opened users in totals, avg over registered", async () => {
+  const s = await setup();
+  try {
+    await seedCardsScenario(s);
+    const t = await authed(s);
+    const j = (await s.call("GET", "/admin/report", { token: t })).json;
+    const c = j.cards;
+    // today (2026-11-20) openers: u-stud 7, u-poly 2, u-fac 4, u-par 6, u-gone 4 (unregistered)
+    assert.deepEqual(c.registered, { users: 6, college: 4, school: 2, student: 3, faculty: 2, parent: 1 });
+    assert.deepEqual(c.active, { users: 4, college: 3, school: 1, student: 2, faculty: 1, parent: 1 });
+    assert.equal(j.summary.totalOpens, 7 + 2 + 4 + 6 + 4); // card 1 unchanged: every recorded open
+    assert.equal(c.avgOpensPerRegisteredUser, Math.round((23 / 6) * 100) / 100);
+    assert.equal(c.excludedProfilesWithoutUid, 1);
+    for (const k of Object.keys(c.active)) assert.ok(c.active[k] <= c.registered[k], k);
+    // college + school and student + faculty + parent partition the registered users (no double counting)
+    assert.equal(c.registered.college + c.registered.school, c.registered.users);
+    assert.equal(c.registered.student + c.registered.faculty + c.registered.parent, c.registered.users);
+  } finally {
+    s.close();
+  }
+});
+
+test("cards: a user with many opens on many days is ONE active user; date range does not change registered", async () => {
+  const s = await setup();
+  try {
+    await seedCardsScenario(s);
+    const t = await authed(s);
+    const get = async (o) => (await s.call("GET", "/admin/report" + q(o), { token: t })).json.cards;
+    const month = await get({ from: "2026-11-01", to: "2026-11-30" });
+    // November openers: u-stud (3 days), u-poly, u-fac, u-sfac, u-par -> 5 distinct registered users
+    assert.equal(month.active.users, 5);
+    assert.equal(month.active.student, 2);
+    assert.equal(month.registered.users, 6);
+    const empty = await get({ from: "2026-01-01", to: "2026-01-31" });
+    assert.deepEqual(empty.active, { users: 0, college: 0, school: 0, student: 0, faculty: 0, parent: 0 });
+    assert.equal(empty.registered.users, 6, "registered total is independent of the date filter");
+    assert.equal(empty.avgOpensPerRegisteredUser, 0);
+    const wed = await get({ from: "2026-11-01", to: "2026-11-30", weekday: "wednesday" }); // Nov 18: only u-stud
+    assert.equal(wed.active.users, 1);
+    assert.equal(wed.registered.users, 6);
+  } finally {
+    s.close();
+  }
+});
+
+test("cards: institution / user type / course / year filters apply to BOTH active and registered; search does not", async () => {
+  const s = await setup();
+  try {
+    await seedCardsScenario(s);
+    const t = await authed(s);
+    const get = async (o) => (await s.call("GET", "/admin/report" + q({ from: "2026-11-01", to: "2026-11-30", ...o }), { token: t })).json;
+    let c = (await get({ institution: "school" })).cards;
+    assert.deepEqual([c.active.users, c.registered.users, c.registered.college, c.registered.school], [2, 2, 0, 2]);
+    c = (await get({ userType: "student" })).cards;
+    assert.deepEqual([c.active.student, c.registered.student, c.registered.faculty], [2, 3, 0]);
+    c = (await get({ course: "btech", year: "2" })).cards; // u-stud + u-never
+    assert.deepEqual([c.active.users, c.registered.users], [1, 2]);
+    c = (await get({ institution: "school", userType: "student" })).cards;
+    assert.deepEqual([c.active.users, c.registered.users], [0, 0]);
+    assert.equal(c.avgOpensPerRegisteredUser, 0, "division by zero handled");
+    const srch = await get({ search: "rahul" });
+    assert.equal(srch.total, 1, "table honours search");
+    assert.deepEqual([srch.cards.active.users, srch.cards.registered.users], [5, 6], "cards ignore search");
+    const sorted = await get({ sort: "name_desc" });
+    assert.deepEqual(sorted.cards, (await get({})).cards, "sort does not change cards");
+  } finally {
+    s.close();
+  }
+});
+
+test("cards: registered population is cached (no profile re-read per request) and dropdowns include registered courses", async () => {
+  const s = await setup();
+  try {
+    await seedCardsScenario(s);
+    await s.db.collection("students").doc("student-005").set({ uid: "u-iti", name: "Iti Never", institution: "college", course: "iti", year: "2" });
+    const t = await authed(s);
+    const j = (await s.call("GET", "/admin/report" + q({ from: "2026-11-20", to: "2026-11-20" }), { token: t })).json;
+    assert.ok(j.options.courses.some((o) => o.value === "iti"), "course of a never-active user is selectable");
+    const reads = s.db.reads;
+    await s.call("GET", "/admin/report" + q({ from: "2026-11-20", to: "2026-11-20", institution: "college" }), { token: t });
+    await s.call("GET", "/admin/report" + q({ from: "2026-11-20", to: "2026-11-20", userType: "faculty" }), { token: t });
+    assert.equal(s.db.reads, reads, "filter changes reuse cached usage rows AND cached population");
+  } finally {
+    s.close();
+  }
+});
+
+test("cards: CSV export appends active / registered summary after the unchanged user table", async () => {
+  const s = await setup();
+  try {
+    await seedCardsScenario(s);
+    const t = await authed(s);
+    const r = await s.call("GET", "/admin/export" + q({ from: "2026-11-20", to: "2026-11-20" }), { token: t });
+    const [table, summary] = r.text.replace("\uFEFF", "").split("\r\n\r\n");
+    assert.match(table.split("\r\n")[0], /^S\.No,User Name/);
+    const lines = summary.trim().split("\r\n");
+    assert.deepEqual(lines, [
+      "Summary,Active Users,Registered Users",
+      "App Users,4,6",
+      "College Users,3,4",
+      "School Users,1,2",
+      "Student Users,2,3",
+      "Faculty Users,1,2",
+      "Parent Users,1,1",
+      "Total App Opens,23,",
+      "Avg Opens / Registered User,3.83,",
+    ]);
+  } finally {
+    s.close();
   }
 });

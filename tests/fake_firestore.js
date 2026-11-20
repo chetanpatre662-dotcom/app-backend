@@ -53,7 +53,7 @@ class FakeDb {
         return { empty: docs.length === 0, docs };
       },
     });
-    return { doc: ref, where: (f, op, v) => query([[f, op, v]]) };
+    return { doc: ref, where: (f, op, v) => query([[f, op, v]]), select: () => query([]), get: () => query([]).get() };
   }
   async runTransaction(fn) {
     for (let attempt = 0; attempt < 500; attempt++) {
