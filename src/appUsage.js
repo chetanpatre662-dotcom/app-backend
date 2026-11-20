@@ -1,24 +1,22 @@
 /**
  * SCEP App Usage Analytics (independent module)
  *
- * Mounted from bus-tracking/index.js with a single line:
- *     app.use("/app-usage", require("./src/appUsage").createAppUsageRouter({ admin, jwt, bcrypt, express }));
+ * Mounted from bus-tracking/index.js (before the existing POST /admin/login route):
+ *     const appUsage = require("./src/appUsage").createAppUsageRouter({ admin, jwt, bcrypt, express });
+ *     app.use("/app-usage", appUsage);
+ *     app.post("/admin/login", appUsage.loginInterceptor);   // falls through to the untouched admin login
  * (the existing "/api" prefix rewrite in index.js maps /api/app-usage/* to /app-usage/*).
  *
  * Nothing here touches GPS / WebSocket / bus-tracking code paths.
  *
  * Collections written (Admin SDK only; the Firestore catch-all rule already denies all client access):
  *   appUsageDaily/{uid}_{YYYY-MM-DD}   one aggregate per user per IST day
- *   appUsageAdmin/credentials          Appcount login (bcrypt hash, tokenVersion, mustChangePassword)
+ *   appUsageAdmin/credentials          written only when Appcount changes the initial password (bcrypt hash)
  *
- * Public (Firebase-token) endpoint
- *   POST /app-usage/open
- * Appcount (separate login) endpoints
- *   POST /app-usage/admin/login
- *   POST /app-usage/admin/change-password
- *   POST /app-usage/admin/logout
- *   GET  /app-usage/admin/report
- *   GET  /app-usage/admin/export
+ * Public (Firebase-token) endpoint:   POST /app-usage/open
+ * Appcount (shared admin login, HttpOnly cookie session):
+ *   POST /admin/login (interceptor)  GET /app-usage/admin/session  POST /app-usage/admin/change-password
+ *   POST /app-usage/admin/logout     GET /app-usage/admin/report   GET /app-usage/admin/export
  */
 "use strict";
 
@@ -37,7 +35,7 @@ const PROFILE_TTL_MS = 12 * 3600 * 1000;
 const PROFILE_CACHE_MAX = 6000;
 const MAX_RANGE_DAYS = 366;
 const SESSION_TTL_SECONDS = 60 * 60; // Appcount session length
-const INITIAL_USERNAME = "Appcount";
+const COOKIE_NAME = "scep_appusage";
 const EVENT_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -551,72 +549,159 @@ function createAppUsageRouter(deps) {
     }
   });
 
-  // ───────────────────────── Appcount credentials ─────────────────────────
+  // ───────────────────────── Appcount account (shared admin login) ─────────
+  // The Appcount account signs in through the EXISTING admin login form (POST /admin/login).
+  // loginInterceptor() runs before that route: only the configured Appcount username is handled here;
+  // anything else (including a wrong Appcount password) falls through to the untouched admin flow.
+  //
+  // Credential source
+  //   * username + INITIAL password: backend environment (APP_USAGE_ADMIN_USERNAME / APP_USAGE_ADMIN_PASSWORD)
+  //   * after the mandatory first change: bcrypt hash in Firestore appUsageAdmin/credentials. From then on
+  //     the environment password is ignored (the .env file is never rewritten at runtime).
+  //   * deleting that Firestore document re-enables the environment password (+ forced change again).
+  const cfg = () => {
+    const env = deps.env || process.env;
+    const username = String(env.APP_USAGE_ADMIN_USERNAME || "").trim();
+    const password = String(env.APP_USAGE_ADMIN_PASSWORD || "");
+    return { username, password, enabled: !!username };
+  };
   const credRef = () => db.collection(ADMIN_COLLECTION).doc(ADMIN_DOC);
 
   async function loadCreds(force = false) {
     if (!force && credCache && now() - credCache.at < CRED_TTL_MS) return credCache.data;
-    let snap = await credRef().get();
-    if (!snap.exists) {
-      // First use: seed the initial credentials (hash computed here, never stored in plain text).
-      const initial = process.env.APPUSAGE_INITIAL_PASSWORD || "Appcount";
-      const passwordHash = await bcrypt.hash(initial, BCRYPT_ROUNDS);
-      try {
-        await credRef().create({
-          username: INITIAL_USERNAME,
-          passwordHash,
-          mustChangePassword: true,
-          tokenVersion: 1,
-          createdAt: Timestamp.fromMillis(now()),
-          updatedAt: Timestamp.fromMillis(now()),
-        });
-      } catch (_) {
-        /* created concurrently */
-      }
-      snap = await credRef().get();
-    }
-    const data = snap.data();
+    const snap = await credRef().get();
+    const data = snap.exists ? snap.data() : null;
     credCache = { data, at: now() };
     return data;
   }
 
-  // Constant-work dummy hash so unknown usernames take the same time as wrong passwords.
-  let dummyHashPromise = null;
-  const dummyHash = () => (dummyHashPromise ||= bcrypt.hash(crypto.randomBytes(12).toString("hex"), BCRYPT_ROUNDS));
-
-  function issueToken(creds, scope) {
-    const ttl = scope === "pwchange" ? 15 * 60 : SESSION_TTL_SECONDS;
-    const token = jwt.sign({ sub: "appcount", scope, tv: creds.tokenVersion }, SESSION_SECRET, {
-      audience: AUDIENCE,
-      expiresIn: ttl,
-      jwtid: crypto.randomUUID(),
-    });
-    return { token, expiresInSeconds: ttl };
+  /** Constant-time string comparison (hash both sides so length does not leak). */
+  function safeEqual(a, b) {
+    const ha = crypto.createHash("sha256").update(String(a)).digest();
+    const hb = crypto.createHash("sha256").update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
   }
 
-  /** scopes: array of allowed token scopes */
-  function sessionAuth(scopes) {
+  /** Checks a password against whichever credential is currently authoritative. */
+  async function verifyPassword(password, doc) {
+    if (typeof password !== "string" || !password || password.length > 128) return false;
+    if (doc && doc.passwordHash) return bcrypt.compare(password, doc.passwordHash);
+    const c = cfg();
+    return !!c.password && safeEqual(password, c.password);
+  }
+
+  const stateOf = (doc) => ({ mustChange: doc ? !!doc.mustChangePassword : true, tv: doc ? doc.tokenVersion || 1 : 0 });
+
+  function issueToken(state, scope) {
+    const ttl = scope === "pwchange" ? 15 * 60 : SESSION_TTL_SECONDS;
+    const token = jwt.sign({ sub: "appcount", scope, tv: state.tv }, SESSION_SECRET, {
+      audience: AUDIENCE,
+      expiresIn: ttl,
+      jwtid: crypto.randomUUID(), // fresh id on every login: no session fixation
+    });
+    return { token, ttl };
+  }
+
+  // Cookie must be sent to /<prefix>/app-usage/* only (prefix is "/api" in production).
+  function cookiePath(req) {
+    const base = String(req.originalUrl || "").split("?")[0].replace(/\/(admin\/login|app-usage\/.*)$/, "");
+    return (base === "/" ? "" : base) + "/app-usage";
+  }
+  function cookieOptions(req, maxAgeMs) {
+    return {
+      httpOnly: true,
+      sameSite: "strict",
+      secure: !!req.secure || (deps.env || process.env).NODE_ENV === "production",
+      path: cookiePath(req),
+      maxAge: maxAgeMs,
+    };
+  }
+  function parseCookies(header) {
+    const out = {};
+    for (const part of String(header || "").split(";")) {
+      const i = part.indexOf("=");
+      if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    }
+    return out;
+  }
+
+  /** Shared /admin/login hook. Calls next() for every non-Appcount request, untouched. */
+  async function loginInterceptor(req, res, next) {
+    try {
+      const c = cfg();
+      const body = req.body;
+      if (!c.enabled || !body || typeof body.username !== "string" || typeof body.password !== "string") return next();
+      const uKey = body.username.trim().toLowerCase();
+      if (uKey !== c.username.toLowerCase()) return next();
+
+      const ip = clientIp(req);
+      const wait = Math.max(loginIpLimiter.peek(ip), loginUserLimiter.peek(uKey));
+      if (wait) {
+        res.set("Retry-After", String(wait));
+        return res.status(429).json({ success: false, error: "Too many login attempts. Try again after 15 minutes." });
+      }
+      const doc = await loadCreds();
+      if (!(await verifyPassword(body.password, doc))) {
+        loginIpLimiter.hit(ip);
+        loginUserLimiter.hit(uKey);
+        return next(); // existing admin flow answers with its normal error
+      }
+      loginIpLimiter.reset(ip);
+      loginUserLimiter.reset(uKey);
+      const st = stateOf(doc);
+      const { token, ttl } = issueToken(st, st.mustChange ? "pwchange" : "full");
+      res.cookie(COOKIE_NAME, token, cookieOptions(req, ttl * 1000));
+      // No token in the body: the browser never sees the session secret and gets no admin token.
+      return res.json({ success: true, appUsage: true, mustChangePassword: st.mustChange, redirect: "app/app-usage.html" });
+    } catch (e) {
+      log("appcount login error:", e && e.message);
+      return next(); // fail open to the normal flow, never block admins
+    }
+  }
+
+  /**
+   * Session guard. Accepts the Appcount cookie, or (allowMainAdmin) a main-admin JWT whose role is "superadmin".
+   * An Appcount cookie never satisfies the main admin APIs and a normal admin JWT never becomes an Appcount session.
+   */
+  function sessionAuth(scopes, { allowMainAdmin = false } = {}) {
     return async (req, res, next) => {
       try {
+        const cookieTok = parseCookies(req.headers.cookie)[COOKIE_NAME];
+        if (cookieTok) {
+          let payload;
+          try {
+            payload = jwt.verify(cookieTok, SESSION_SECRET, { audience: AUDIENCE });
+          } catch (_) {
+            return res.status(401).json({ success: false, error: "Session expired. Please log in again." });
+          }
+          if (req.method !== "GET" && req.headers["x-app-usage"] !== "1") {
+            return res.status(403).json({ success: false, error: "Missing CSRF header" });
+          }
+          const exp = revoked.get(payload.jti);
+          if (exp && exp > now()) return res.status(401).json({ success: false, error: "Session ended. Please log in again." });
+          const doc = await loadCreds();
+          if (payload.tv !== stateOf(doc).tv) {
+            return res.status(401).json({ success: false, error: "Session expired. Please log in again." });
+          }
+          if (!scopes.includes(payload.scope)) {
+            return res.status(403).json({ success: false, error: "Password change required before accessing analytics" });
+          }
+          req.appcount = { role: "appcount", jti: payload.jti, exp: payload.exp, scope: payload.scope };
+          return next();
+        }
         const h = String(req.headers.authorization || "");
-        if (!h.startsWith("Bearer ")) return res.status(401).json({ success: false, error: "Authentication required" });
-        let payload;
-        try {
-          payload = jwt.verify(h.slice(7), SESSION_SECRET, { audience: AUDIENCE });
-        } catch (_) {
-          return res.status(401).json({ success: false, error: "Session expired or invalid. Please log in again." });
+        if (allowMainAdmin && h && !h.startsWith("Bearer ") && scopes.includes("full")) {
+          try {
+            const d = jwt.verify(h, jwtBase);
+            if (d && d.admin && d.role === "superadmin") {
+              req.appcount = { role: "superadmin", scope: "full" };
+              return next();
+            }
+          } catch (_) {
+            /* fall through */
+          }
         }
-        const exp = revoked.get(payload.jti);
-        if (exp && exp > now()) return res.status(401).json({ success: false, error: "Session ended. Please log in again." });
-        const creds = await loadCreds();
-        if (payload.tv !== creds.tokenVersion) {
-          return res.status(401).json({ success: false, error: "Session expired. Please log in again." });
-        }
-        if (!scopes.includes(payload.scope)) {
-          return res.status(403).json({ success: false, error: "Password change required before accessing analytics" });
-        }
-        req.appcount = { creds, jti: payload.jti, exp: payload.exp };
-        return next();
+        return res.status(401).json({ success: false, error: "Authentication required" });
       } catch (e) {
         log("session error:", e && e.message);
         return res.status(500).json({ success: false, error: "Server error" });
@@ -624,37 +709,9 @@ function createAppUsageRouter(deps) {
     };
   }
 
-  router.post("/admin/login", async (req, res) => {
-    const ip = clientIp(req);
-    try {
-      const { username, password } = req.body || {};
-      if (typeof username !== "string" || typeof password !== "string" || username.length > 64 || password.length > 128) {
-        return res.status(400).json({ success: false, error: "Username and password are required" });
-      }
-      const uKey = username.trim().toLowerCase();
-      const wait = Math.max(loginIpLimiter.peek(ip), loginUserLimiter.peek(uKey));
-      if (wait) {
-        res.set("Retry-After", String(wait));
-        return res.status(429).json({ success: false, error: "Too many failed attempts. Try again later." });
-      }
-      const creds = await loadCreds();
-      const userOk = uKey === String(creds.username).toLowerCase();
-      const hash = userOk ? creds.passwordHash : await dummyHash();
-      const passOk = await bcrypt.compare(password, hash);
-      if (!userOk || !passOk) {
-        loginIpLimiter.hit(ip);
-        loginUserLimiter.hit(uKey);
-        return res.status(401).json({ success: false, error: "Invalid username or password" });
-      }
-      loginIpLimiter.reset(ip);
-      loginUserLimiter.reset(uKey);
-      const mustChange = !!creds.mustChangePassword;
-      const { token, expiresInSeconds } = issueToken(creds, mustChange ? "pwchange" : "full");
-      return res.json({ success: true, token, expiresInSeconds, mustChangePassword: mustChange });
-    } catch (e) {
-      log("login error:", e && e.message);
-      return res.status(500).json({ success: false, error: "Server error" });
-    }
+  router.get("/admin/session", sessionAuth(["pwchange", "full"], { allowMainAdmin: true }), (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, role: req.appcount.role, mustChangePassword: req.appcount.scope === "pwchange" });
   });
 
   router.post("/admin/change-password", sessionAuth(["pwchange", "full"]), async (req, res) => {
@@ -674,15 +731,20 @@ function createAppUsageRouter(deps) {
         pwChangeLimiter.hit(cpIp);
         return res.status(400).json({ success: false, error: problem });
       }
-      const creds = await loadCreds(true);
-      if (!(await bcrypt.compare(currentPassword, creds.passwordHash))) {
+      const doc = await loadCreds(true);
+      if (!(await verifyPassword(currentPassword, doc))) {
         pwChangeLimiter.hit(cpIp);
-        // 400 (not 401) so the admin page does not treat it as an expired session.
+        // 400 (not 401) so the page does not treat it as an expired session.
         return res.status(400).json({ success: false, error: "Current password is incorrect" });
       }
+      const c = cfg();
+      if (c.password && safeEqual(newPassword, c.password)) {
+        return res.status(400).json({ success: false, error: "New password must differ from the initial password" });
+      }
       const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-      const tokenVersion = (creds.tokenVersion || 1) + 1; // invalidates every older session
-      await credRef().update({
+      const tokenVersion = (doc ? doc.tokenVersion || 1 : 0) + 1; // invalidates every older session
+      await credRef().set({
+        username: c.username,
         passwordHash,
         mustChangePassword: false,
         tokenVersion,
@@ -690,8 +752,9 @@ function createAppUsageRouter(deps) {
       });
       credCache = null;
       const fresh = await loadCreds(true);
-      const { token, expiresInSeconds } = issueToken(fresh, "full");
-      return res.json({ success: true, token, expiresInSeconds, mustChangePassword: false });
+      const { token, ttl } = issueToken(stateOf(fresh), "full");
+      res.cookie(COOKIE_NAME, token, cookieOptions(req, ttl * 1000));
+      return res.json({ success: true, mustChangePassword: false });
     } catch (e) {
       log("change-password error:", e && e.message);
       return res.status(500).json({ success: false, error: "Server error" });
@@ -701,6 +764,7 @@ function createAppUsageRouter(deps) {
   router.post("/admin/logout", sessionAuth(["pwchange", "full"]), (req, res) => {
     revoked.set(req.appcount.jti, req.appcount.exp * 1000);
     for (const [k, v] of revoked) if (v <= now()) revoked.delete(k);
+    res.clearCookie(COOKIE_NAME, { ...cookieOptions(req), maxAge: undefined });
     res.json({ success: true });
   });
 
@@ -778,7 +842,7 @@ function createAppUsageRouter(deps) {
     return f;
   }
 
-  router.get("/admin/report", sessionAuth(["full"]), async (req, res) => {
+  router.get("/admin/report", sessionAuth(["full"], { allowMainAdmin: true }), async (req, res) => {
     try {
       const f = reportGuard(req, res);
       if (!f) return;
@@ -808,7 +872,7 @@ function createAppUsageRouter(deps) {
     }
   });
 
-  router.get("/admin/export", sessionAuth(["full"]), async (req, res) => {
+  router.get("/admin/export", sessionAuth(["full"], { allowMainAdmin: true }), async (req, res) => {
     try {
       const f = reportGuard(req, res);
       if (!f) return;
@@ -824,6 +888,7 @@ function createAppUsageRouter(deps) {
     }
   });
 
+  router.loginInterceptor = loginInterceptor;
   router._internals = { profileCache, rangeCache, openLimiter };
   return router;
 }

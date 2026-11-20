@@ -7509,6 +7509,17 @@ cron.schedule("0 0 1 8 *", async () => {
   }
 });
 
+// ── App Usage Analytics (independent module, see src/appUsage.js) ─────────────
+// /app-usage/*: Firebase-token open events + Appcount analytics API.
+// Appcount signs in through the shared POST /admin/login: the interceptor handles ONLY the configured
+// Appcount username and calls next() for everyone else, so the admin login below is unchanged.
+try {
+  const appUsageRouter = require("./src/appUsage").createAppUsageRouter({ admin, jwt, bcrypt, express });
+  app.use("/app-usage", appUsageRouter);
+  app.post("/admin/login", appUsageRouter.loginInterceptor);
+  console.log("App usage analytics routes mounted");
+} catch (e) { console.log("App usage analytics NOT mounted:", e.message); }
+
 /* =========================
    ADMIN LOGIN — UNIFIED
    POST /admin/login  (handles college, school, AND super admin)
@@ -9142,13 +9153,6 @@ app.get("/api/bus-pass/photo-url/:studentId", async (req, res) => {
   } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-
-// ── App Usage Analytics (independent module: POST /app-usage/open + Appcount admin API) ──
-// Separate from GPS / WebSocket / bus tracking. See src/appUsage.js.
-try {
-  app.use("/app-usage", require("./src/appUsage").createAppUsageRouter({ admin, jwt, bcrypt, express }));
-  console.log("App usage analytics routes mounted");
-} catch (e) { console.log("App usage analytics NOT mounted:", e.message); }
 
 // Multer / upload error handler � returns JSON instead of HTML
 app.use((err, req, res, next) => {

@@ -21,13 +21,16 @@ const DAY = 86400000;
 const T0 = Date.UTC(2026, 10, 20, 4, 30, 0);
 
 async function setup(opts = {}) {
-  const db = new FakeDb();
-  const clock = { t: T0 };
+  const db = opts.db || new FakeDb();
+  const clock = opts.clock || { t: T0 };
+  const env = opts.env || { APP_USAGE_ADMIN_USERNAME: "Appcount", APP_USAGE_ADMIN_PASSWORD: "Appcount" };
+  if (!opts.db) {
   await db.collection("students").doc("student-001").set({ uid: "u-stud", name: "RAHUL SHARMA", mobile: "9876543210", institution: "college", course: "btech", year: "2", studentType: "college" });
   await db.collection("students").doc("student-002").set({ uid: "u-poly", name: "Amit Verma", mobile: "9000000001", institution: "college", course: "poly", year: "1" });
   await db.collection("faculty").doc("faculty-001").set({ uid: "u-fac", name: "Dr Mehta", mobile: "9111111111", institution: "college", facultyType: "College" });
   await db.collection("faculty").doc("faculty-002").set({ uid: "u-sfac", name: "Mrs Rao", mobile: "9222222222", institution: "school", facultyType: "School" });
   await db.collection("parents").doc("parent-001").set({ uid: "u-par", name: "Sunita Devi", mobile: "9333333333", institution: "school" });
+  }
   const router = mod.createAppUsageRouter({
     admin,
     jwt,
@@ -35,6 +38,7 @@ async function setup(opts = {}) {
     express,
     db,
     jwtSecret: "test-secret",
+    env,
     now: () => clock.t,
     verifyIdToken: async (t) => {
       if (t.startsWith("good-")) return { uid: t.slice(5) };
@@ -45,27 +49,40 @@ async function setup(opts = {}) {
   const app = express();
   app.use(express.json());
   app.use("/app-usage", router);
+  app.post("/admin/login", router.loginInterceptor);
+  // Stand-in for the untouched existing admin login / admin API (the real ones are exercised in the guarded index.js run).
+  app.post("/admin/login", (req, res) => {
+    const { username, password } = req.body || {};
+    if (username === "admin" && password === "adminpass") return res.json({ success: true, token: jwt.sign({ admin: true, role: "admin", institution: "college" }, "test-secret"), institution: "college", role: "admin" });
+    return res.status(401).json({ success: false, error: "Invalid username or password" });
+  });
+  app.get("/admin/buses", (req, res) => {
+    try { const d = jwt.verify(req.headers.authorization || "", "test-secret"); if (!d.admin) throw new Error("x"); res.json({ success: true }); } catch (_) { res.status(401).json({ error: "Invalid token" }); }
+  });
   const server = await new Promise((r) => {
     const s = app.listen(0, "127.0.0.1", () => r(s));
   });
-  const base = `http://127.0.0.1:${server.address().port}/app-usage`;
-  const call = async (method, path, { token, body, raw } = {}) => {
-    const res = await fetch(base + path, {
-      method,
-      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+  const root = `http://127.0.0.1:${server.address().port}`;
+  const base = root + "/app-usage";
+  // token: for /admin/* paths it is the Appcount SESSION COOKIE value; for /open it is the Firebase bearer token.
+  const call = async (method, path, { token, body, rootPath, rawAuth, noCsrf, headers: extra } = {}) => {
+    const isAdmin = path.startsWith("/admin");
+    const headers = { "Content-Type": "application/json", ...(extra || {}) };
+    if (token && isAdmin) { headers.Cookie = `scep_appusage=${token}`; if (method !== "GET" && !noCsrf) headers["X-App-Usage"] = "1"; }
+    else if (token) headers.Authorization = `Bearer ${token}`;
+    if (rawAuth) headers.Authorization = rawAuth;
+    const res = await fetch((rootPath ? root : base) + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
     const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
     let json = null;
-    try {
-      json = JSON.parse(text);
-    } catch (_) {}
-    return { status: res.status, json, text, headers: res.headers };
+    try { json = JSON.parse(text); } catch (_) {}
+    const setCookie = (res.headers.getSetCookie ? res.headers.getSetCookie() : [])[0] || null;
+    const cookie = setCookie ? setCookie.split(";")[0].split("=").slice(1).join("=") : null;
+    return { status: res.status, json, text, headers: res.headers, setCookie, cookie };
   };
   let n = 0;
   const eid = () => `evt_${String(++n).padStart(6, "0")}_abcdefghij`;
   const open = (uid, extra = {}, tokenOverride) => call("POST", "/open", { token: tokenOverride || `good-${uid}`, body: { eventId: eid(), ...extra } });
-  return { db, clock, call, open, eid, close: () => server.close(), router };
+  return { db, clock, call, open, eid, port: server.address().port, close: () => server.close(), router };
 }
 
 const dailyDoc = (db, uid, key) => (db.docs.get(`appUsageDaily/${uid}_${key}`) || {}).data;
@@ -323,108 +340,208 @@ test("open: Firestore cost - repeat opens need no profile reads (1 tx read + 1 w
 // ───────────────────────── Appcount auth ─────────────────────────
 const NEW_PW = "Br1ghtSession!42";
 
-async function loginInitial(s) {
-  return s.call("POST", "/admin/login", { body: { username: "Appcount", password: "Appcount" } });
+// Appcount signs in through the SHARED POST /admin/login (interceptor in front of the existing handler).
+async function loginInitial(s, password = "Appcount", username = "Appcount") {
+  return s.call("POST", "/admin/login", { rootPath: true, body: { username, password } });
 }
 
-test("admin: initial login works but only yields a password-change token; analytics blocked", async () => {
+test("shared login: normal admin credentials pass through the interceptor untouched", async () => {
+  const s = await setup();
+  try {
+    const ok = await s.call("POST", "/admin/login", { rootPath: true, body: { username: "admin", password: "adminpass" } });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.json.role, "admin");
+    assert.ok(ok.json.token && !ok.setCookie, "admin gets its normal token and no Appcount cookie");
+    const bad = await s.call("POST", "/admin/login", { rootPath: true, body: { username: "admin", password: "nope" } });
+    assert.equal(bad.status, 401);
+    assert.deepEqual(bad.json, { success: false, error: "Invalid username or password" });
+    assert.equal((await s.call("GET", "/admin/buses", { rootPath: true, rawAuth: ok.json.token })).status, 200);
+    // missing / non-string credentials also fall through
+    assert.equal((await s.call("POST", "/admin/login", { rootPath: true, body: { username: ["Appcount"], password: {} } })).status, 401);
+  } finally {
+    s.close();
+  }
+});
+
+test("shared login: Appcount initial login -> session cookie only, forced password change, analytics blocked", async () => {
   const s = await setup();
   try {
     const r = await loginInitial(s);
     assert.equal(r.status, 200);
+    assert.equal(r.json.appUsage, true);
     assert.equal(r.json.mustChangePassword, true);
-    // hash stored, never plain text
-    const stored = s.db.docs.get("appUsageAdmin/credentials").data;
-    assert.ok(stored.passwordHash.startsWith("$2"));
-    assert.notEqual(stored.passwordHash, "Appcount");
-    const rep = await s.call("GET", "/admin/report", { token: r.json.token });
-    assert.equal(rep.status, 403);
-    const exp = await s.call("GET", "/admin/export", { token: r.json.token });
-    assert.equal(exp.status, 403);
+    assert.equal(r.json.token, undefined, "no token in the body");
+    assert.match(r.setCookie, /HttpOnly/i);
+    assert.match(r.setCookie, /SameSite=Strict/i);
+    assert.match(r.setCookie, /Path=\/app-usage/);
+    const sess = await s.call("GET", "/admin/session", { token: r.cookie });
+    assert.deepEqual([sess.status, sess.json.role, sess.json.mustChangePassword], [200, "appcount", true]);
+    assert.equal((await s.call("GET", "/admin/report", { token: r.cookie })).status, 403);
+    assert.equal((await s.call("GET", "/admin/export", { token: r.cookie })).status, 403);
+    // nothing was written to Firestore by merely logging in (no plaintext password anywhere)
+    assert.equal(s.db.docs.has("appUsageAdmin/credentials"), false);
   } finally {
     s.close();
   }
 });
 
-test("admin: wrong creds, unknown user and unauthenticated access", async () => {
+test("shared login: wrong Appcount password / other names get the normal error and no cookie", async () => {
   const s = await setup();
   try {
-    assert.equal((await s.call("POST", "/admin/login", { body: { username: "Appcount", password: "nope" } })).status, 401);
-    assert.equal((await s.call("POST", "/admin/login", { body: { username: "root", password: "Appcount" } })).status, 401);
-    assert.equal((await s.call("POST", "/admin/login", { body: { username: 5, password: 1 } })).status, 400);
+    const wrong = await loginInitial(s, "nope");
+    assert.equal(wrong.status, 401);
+    assert.deepEqual(wrong.json, { success: false, error: "Invalid username or password" });
+    assert.equal(wrong.setCookie, null);
+    assert.equal((await loginInitial(s, "Appcount", "root")).status, 401);
+    // case-insensitive username match, password stays exact
+    assert.equal((await loginInitial(s, "Appcount", "appcount")).status, 200);
+    assert.equal((await loginInitial(s, "appcount")).status, 401);
+  } finally {
+    s.close();
+  }
+});
+
+test("shared login: Appcount disabled when the env username is empty (no hardcoded fallback)", async () => {
+  const s = await setup({ env: { APP_USAGE_ADMIN_USERNAME: "", APP_USAGE_ADMIN_PASSWORD: "Appcount" } });
+  try {
+    assert.equal((await loginInitial(s)).status, 401);
+  } finally {
+    s.close();
+  }
+  const s2 = await setup({ env: { APP_USAGE_ADMIN_USERNAME: "Appcount" } }); // no password configured
+  try {
+    assert.equal((await loginInitial(s2)).status, 401);
+    assert.equal((await loginInitial(s2, "")).status, 401);
+  } finally {
+    s2.close();
+  }
+});
+
+test("authorization: unauthenticated, tampered, foreign tokens are rejected; Appcount cannot reach admin APIs", async () => {
+  const s = await setup();
+  try {
     assert.equal((await s.call("GET", "/admin/report")).status, 401);
+    assert.equal((await s.call("GET", "/admin/session")).status, 401);
     assert.equal((await s.call("GET", "/admin/report", { token: "abc.def.ghi" })).status, 401);
-    // a main-admin style JWT (different secret/audience) must not work
-    const mainAdminJwt = jwt.sign({ admin: true, role: "superadmin", institution: "all" }, "test-secret");
-    assert.equal((await s.call("GET", "/admin/report", { token: mainAdminJwt })).status, 401);
-    // Firebase user token is not an Appcount token
     assert.equal((await s.call("GET", "/admin/report", { token: "good-u-stud" })).status, 401);
+    const adminJwt = jwt.sign({ admin: true, role: "admin", institution: "college" }, "test-secret");
+    const superJwt = jwt.sign({ admin: true, role: "superadmin", institution: "all" }, "test-secret");
+    // a main-admin JWT placed in the Appcount cookie is not an Appcount session
+    assert.equal((await s.call("GET", "/admin/report", { token: superJwt })).status, 401);
+    // a normal (college/school) admin never becomes an Appcount session; only an explicit super-admin may read reports
+    assert.equal((await s.call("GET", "/admin/report", { rawAuth: adminJwt })).status, 401);
+    assert.equal((await s.call("GET", "/admin/report", { rawAuth: superJwt })).status, 200);
+    assert.equal((await s.call("GET", "/admin/session", { rawAuth: superJwt })).json.role, "superadmin");
+    // super-admin cannot change the Appcount password or use its logout
+    assert.equal((await s.call("POST", "/admin/change-password", { rawAuth: superJwt, body: { currentPassword: "x", newPassword: NEW_PW } })).status, 401);
+    // the Appcount cookie does not unlock a normal admin API
+    const c = await authed(s);
+    assert.equal((await s.call("GET", "/admin/report", { token: c })).status, 200);
+    const res = await fetch(`http://127.0.0.1:${s.port}/admin/buses`, { headers: { Cookie: `scep_appusage=${c}`, Authorization: c } });
+    assert.equal(res.status, 401);
+    // Firebase user routes are not an admin route either
+    assert.equal((await s.call("GET", "/admin/buses", { rootPath: true, rawAuth: `Bearer ${c}` })).status, 401);
   } finally {
     s.close();
   }
 });
 
-test("admin: login lockout after repeated failures (429), correct password also blocked during lockout", async () => {
+test("login brute force: Appcount lockout after 5 failures; even the right password is refused meanwhile", async () => {
   const s = await setup();
   try {
-    for (let i = 0; i < 5; i++) await s.call("POST", "/admin/login", { body: { username: "Appcount", password: "bad" + i } });
+    for (let i = 0; i < 5; i++) await loginInitial(s, "bad" + i);
     const r = await loginInitial(s);
     assert.equal(r.status, 429);
     assert.ok(r.headers.get("retry-after"));
+    assert.equal(r.setCookie, null);
   } finally {
     s.close();
   }
 });
 
-test("admin: mandatory password change, policy, old password dead, session survives properly", async () => {
+test("password change: mandatory, CSRF-protected, policy enforced, stored only as bcrypt hash", async () => {
   const s = await setup();
   try {
     const l = await loginInitial(s);
-    const tok = l.json.token;
-    // policy failures
+    const tok = l.cookie;
+    const body = (cur, nw) => ({ currentPassword: cur, newPassword: nw });
+    // CSRF: cookie session without the custom header is refused
+    assert.equal((await s.call("POST", "/admin/change-password", { token: tok, noCsrf: true, body: body("Appcount", NEW_PW) })).status, 403);
     for (const bad of ["short", "alllowercase12345", "Appcount12345", "NoDigitsHereAtAll"]) {
-      const r = await s.call("POST", "/admin/change-password", { token: tok, body: { currentPassword: "Appcount", newPassword: bad } });
-      assert.equal(r.status, 400, bad);
+      assert.equal((await s.call("POST", "/admin/change-password", { token: tok, body: body("Appcount", bad) })).status, 400, bad);
     }
-    // wrong current password
-    assert.equal((await s.call("POST", "/admin/change-password", { token: tok, body: { currentPassword: "WRONG", newPassword: NEW_PW } })).status, 400);
-    // success
-    const ok = await s.call("POST", "/admin/change-password", { token: tok, body: { currentPassword: "Appcount", newPassword: NEW_PW } });
+    assert.equal((await s.call("POST", "/admin/change-password", { token: tok, body: body("WRONG", NEW_PW) })).status, 400);
+    const ok = await s.call("POST", "/admin/change-password", { token: tok, body: body("Appcount", NEW_PW) });
     assert.equal(ok.status, 200);
     assert.equal(ok.json.mustChangePassword, false);
-    // old pwchange token is now invalid; new token works on reports
+    assert.equal(ok.json.token, undefined);
+    assert.ok(ok.cookie && ok.cookie !== tok, "a fresh session cookie is issued (no session fixation)");
+    const doc = s.db.docs.get("appUsageAdmin/credentials").data;
+    assert.ok(doc.passwordHash.startsWith("$2"), "bcrypt hash stored");
+    assert.ok(!JSON.stringify(doc).includes(NEW_PW), "plaintext password never stored");
+    assert.equal(doc.password, undefined);
+    // old (pre-change) session dead, new session alive
     assert.equal((await s.call("GET", "/admin/report", { token: tok })).status, 401);
-    assert.equal((await s.call("GET", "/admin/report", { token: ok.json.token })).status, 200);
-    // old password no longer logs in, new does and is NOT forced to change again
-    const old = await s.call("POST", "/admin/login", { body: { username: "Appcount", password: "Appcount" } });
+    assert.equal((await s.call("GET", "/admin/report", { token: ok.cookie })).status, 200);
+    // initial password no longer works, new one does and is not forced to change again
+    const old = await loginInitial(s, "Appcount");
     assert.equal(old.status, 401);
-    const fresh = await s.call("POST", "/admin/login", { body: { username: "appcount", password: NEW_PW } });
+    assert.equal(old.setCookie, null);
+    const fresh = await loginInitial(s, NEW_PW);
     assert.equal(fresh.status, 200);
     assert.equal(fresh.json.mustChangePassword, false);
-    // credentials never leak in responses
-    assert.ok(!ok.text.includes(NEW_PW) && !fresh.text.includes("passwordHash"));
+    assert.equal((await s.call("GET", "/admin/report", { token: fresh.cookie })).status, 200);
+    assert.notEqual(fresh.cookie, ok.cookie);
   } finally {
     s.close();
   }
 });
 
-test("admin: session expiry and logout revoke the token", async () => {
+test("password change survives a backend restart (stored in Firestore) and the .env password stays dead", async () => {
+  const s = await setup();
+  const db = s.db, clock = s.clock;
+  try {
+    await authed(s);
+  } finally {
+    s.close();
+  }
+  const s2 = await setup({ db, clock }); // "restart": new process state, same Firestore, same .env
+  try {
+    assert.equal((await loginInitial(s2, "Appcount")).status, 401);
+    assert.equal((await loginInitial(s2, NEW_PW)).status, 200);
+  } finally {
+    s2.close();
+  }
+  // operator reset: deleting the credential document re-enables the .env password with a forced change
+  db.docs.delete("appUsageAdmin/credentials");
+  const s3 = await setup({ db, clock });
+  try {
+    const r = await loginInitial(s3, "Appcount");
+    assert.equal(r.status, 200);
+    assert.equal(r.json.mustChangePassword, true);
+  } finally {
+    s3.close();
+  }
+});
+
+test("session: logout invalidates + clears cookie, expired cookie rejected", async () => {
   const s = await setup();
   try {
-    const l = await loginInitial(s);
-    const ok = await s.call("POST", "/admin/change-password", { token: l.json.token, body: { currentPassword: "Appcount", newPassword: NEW_PW } });
-    const tok = ok.json.token;
+    const tok = await authed(s);
     assert.equal((await s.call("GET", "/admin/report", { token: tok })).status, 200);
-    assert.equal((await s.call("POST", "/admin/logout", { token: tok })).status, 200);
+    assert.equal((await s.call("POST", "/admin/logout", { token: tok, noCsrf: true })).status, 403);
+    const out = await s.call("POST", "/admin/logout", { token: tok });
+    assert.equal(out.status, 200);
+    assert.match(out.setCookie, /scep_appusage=;/);
     assert.equal((await s.call("GET", "/admin/report", { token: tok })).status, 401);
-    // expired token
-    const expired = jwt.sign({ sub: "appcount", scope: "full", tv: 2 }, require("crypto").createHash("sha256").update("test-secret::app-usage-session").digest("hex"), { audience: "app-usage-admin", expiresIn: -10 });
-    const r = await s.call("GET", "/admin/report", { token: expired });
-    assert.equal(r.status, 401);
+    const secret = require("crypto").createHash("sha256").update("test-secret::app-usage-session").digest("hex");
+    const expired = jwt.sign({ sub: "appcount", scope: "full", tv: 1 }, secret, { audience: "app-usage-admin", expiresIn: -10 });
+    assert.equal((await s.call("GET", "/admin/report", { token: expired })).status, 401);
   } finally {
     s.close();
   }
 });
+
 
 // ───────────────────────── reporting ─────────────────────────
 async function seedUsage(s) {
@@ -452,8 +569,8 @@ async function seedUsage(s) {
 
 async function authed(s) {
   const l = await loginInitial(s);
-  const ok = await s.call("POST", "/admin/change-password", { token: l.json.token, body: { currentPassword: "Appcount", newPassword: NEW_PW } });
-  return ok.json.token;
+  const ok = await s.call("POST", "/admin/change-password", { token: l.cookie, body: { currentPassword: "Appcount", newPassword: NEW_PW } });
+  return ok.cookie;
 }
 const q = (o) => "?" + new URLSearchParams(o).toString();
 
