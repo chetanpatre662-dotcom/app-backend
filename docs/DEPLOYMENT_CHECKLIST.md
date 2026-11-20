@@ -10,6 +10,7 @@
   - JWT_SECRET
   - BUSPASS_USERNAME, BUSPASS_PASS_HASH
 - [ ] Verify `serviceAccountKey.json` is present
+- [ ] Verify the key belongs to the only Firebase project: `node -e "console.log(require('./serviceAccountKey.json').project_id)"` must print `bus-tracker-b34eb` (bucket `bus-tracker-b34eb.firebasestorage.app`)
 - [ ] Verify Redis is running: `redis-cli ping`
 - [ ] Verify `logs/` directory exists: `mkdir -p logs`
 - [ ] Install dependencies: `npm install --production`

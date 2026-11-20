@@ -9143,6 +9143,13 @@ app.get("/api/bus-pass/photo-url/:studentId", async (req, res) => {
 });
 
 
+// ── App Usage Analytics (independent module: POST /app-usage/open + Appcount admin API) ──
+// Separate from GPS / WebSocket / bus tracking. See src/appUsage.js.
+try {
+  app.use("/app-usage", require("./src/appUsage").createAppUsageRouter({ admin, jwt, bcrypt, express }));
+  console.log("App usage analytics routes mounted");
+} catch (e) { console.log("App usage analytics NOT mounted:", e.message); }
+
 // Multer / upload error handler � returns JSON instead of HTML
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {

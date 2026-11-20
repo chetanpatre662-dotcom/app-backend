@@ -10,7 +10,7 @@ if (!admin.apps.length) {
     const serviceAccount = require(serviceAccountPath);
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
-      storageBucket: "scep-bus.firebasestorage.app",
+      storageBucket: "bus-tracker-b34eb.firebasestorage.app",
     });
     console.log("Firebase Storage Bucket:", admin.storage().bucket().name);
   } else {
